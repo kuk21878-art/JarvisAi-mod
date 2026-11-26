@@ -1107,20 +1107,23 @@ inline void onModuleConfigChanged(std::string_view moduleId, std::string_view ke
     if (panel->set(std::string(key), value)) saveConfig();
 }
 
+// Note: modId is deliberately NOT set. The preloader fills it in from the mod that is
+// being enabled and rejects the module when a different id is declared.
 inline void registerModules() {
     auto& c = core();
     if (c.registered) return;
     for (auto& panel : c.panels) {
         pl::modmenu::ModuleBuilder builder(panel->id, panel->name.c_str());
         builder.description(panel->description.c_str())
-            .modId(c.modId)
             .defaultEnabled(panel->enabled)
             .onToggle(onModuleToggle)
             .onConfigChanged(onModuleConfigChanged);
         for (const auto& entry : panel->entries()) {
             builder.config(entry.key, entry.displayName, entry.type, entry.defaultValue, entry.minValue, entry.maxValue, std::string());
         }
-        builder.registerModule();
+        if (!builder.registerModule()) {
+            std::fprintf(stderr, "[Jarvis] Mod Menu rejected module %s\n", panel->id.c_str());
+        }
     }
     c.registered = true;
 }
