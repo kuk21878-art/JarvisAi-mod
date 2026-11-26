@@ -1297,6 +1297,7 @@ private:
 // J.A.R.V.I.S. AI: asks Claude about the situation around the player
 // ===========================================================================
 //
+// Providers (all plain HTTPS APIs): Groq (free tier), xAI Grok (paid) and Anthropic Claude (paid).
 // The HTTPS request goes through java.net.HttpURLConnection (JNI), so the phone's own
 // certificate store is used and no TLS library has to be bundled. The only data that
 // leaves the device is the text built in buildState() plus the API key header.
@@ -1612,6 +1613,7 @@ inline std::string trimCopy(std::string_view value) {
 // ---- background worker -----------------------------------------------------
 
 struct AiJob {
+    std::string provider;   // groq (free tier), grok (xAI, paid) or claude (Anthropic, paid)
     std::string apiKey;
     std::string model;
     std::string language;
@@ -1638,16 +1640,32 @@ inline AiService& ai() {
     return instance;
 }
 
-inline void aiRunJob(const AiJob& job) {
-    auto& a = ai();
-    auto fail = [&](const std::string& message) {
-        std::lock_guard<std::mutex> lock(a.mutex);
-        a.error = message;
-        a.answer.clear();
-        a.answerAt = std::chrono::steady_clock::now();
-    };
+struct ProviderInfo {
+    std::string url;
+    std::string defaultModel;
+    bool anthropic = false;
+};
 
-    const Snapshot snap = snapshot();
+inline ProviderInfo providerInfo(std::string name) {
+    for (auto& ch : name) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    if (name == "claude" || name == "anthropic") {
+        return {"https://api.anthropic.com/v1/messages", "claude-haiku-5-5", true};
+    }
+    if (name == "grok" || name == "xai") {
+        return {"https://api.x.ai/v1/chat/completions", "grok-4.20-0309-non-reasoning", false};
+    }
+    return {"https://api.groq.com/openai/v1/chat/completions", "llama-3.1-8b-instant", false};   // default: Groq
+}
+
+struct AiRequest {
+    std::string url;
+    std::vector<std::pair<std::string, std::string>> headers;
+    std::string body;
+};
+
+inline AiRequest buildAiRequest(const AiJob& job, const Snapshot& snap) {
+    const ProviderInfo info = providerInfo(job.provider);
+    const std::string model = job.model.empty() ? info.defaultModel : job.model;
     const std::string language = job.language.empty() ? std::string("English") : job.language;
     const std::string system =
         "You are J.A.R.V.I.S., the tactical assistant in the heads-up display of a Minecraft Bedrock player. "
@@ -1662,50 +1680,87 @@ inline void aiRunJob(const AiJob& job) {
     }
     user += buildState(snap);
 
-    nlohmann::json request;
-    request["model"] = job.model;
-    request["max_tokens"] = 300;
-    request["system"] = system;
-    request["messages"] = nlohmann::json::array({{{"role", "user"}, {"content", user}}});
-
-    const HttpResult response = httpPostJson(
-        "https://api.anthropic.com/v1/messages",
-        {{"content-type", "application/json"}, {"x-api-key", job.apiKey}, {"anthropic-version", "2023-06-01"}},
-        request.dump(), 10000, 30000);
-
-    if (response.status == 0) {
-        fail("NETWORK: " + response.error);
-        return;
+    AiRequest request;
+    request.url = info.url;
+    request.headers = {{"content-type", "application/json"}, {"user-agent", "JarvisMod/1.0"}};
+    nlohmann::json body;
+    body["model"] = model;
+    if (info.anthropic) {
+        request.headers.emplace_back("x-api-key", job.apiKey);
+        request.headers.emplace_back("anthropic-version", "2023-06-01");
+        body["max_tokens"] = 300;
+        body["system"] = system;
+        body["messages"] = nlohmann::json::array({{{"role", "user"}, {"content", user}}});
+    } else {
+        request.headers.emplace_back("authorization", "Bearer " + job.apiKey);
+        body["max_completion_tokens"] = 400;
+        body["temperature"] = 0.4;
+        if (model.find("gpt-oss") != std::string::npos) body["reasoning_effort"] = "low";
+        body["messages"] = nlohmann::json::array({{{"role", "system"}, {"content", system}},
+                                                  {{"role", "user"}, {"content", user}}});
     }
+    request.body = body.dump();
+    return request;
+}
 
-    nlohmann::json parsed = nlohmann::json::parse(response.body, nullptr, false);
+// Pulls the answer (or a readable error) out of the HTTP result. Returns true on success.
+inline bool parseAiResponse(const std::string& provider, const HttpResult& response, std::string& text, std::string& error) {
+    if (response.status == 0) {
+        error = "NETWORK: " + response.error;
+        return false;
+    }
+    const nlohmann::json parsed = nlohmann::json::parse(response.body, nullptr, false);
     if (!response.ok) {
         std::string message = response.error;
-        if (parsed.is_object() && parsed.contains("error") && parsed["error"].is_object() &&
-            parsed["error"].contains("message") && parsed["error"]["message"].is_string()) {
-            message = parsed["error"]["message"].get<std::string>();
-        }
-        if (response.status == 401) message = "Invalid API key";
-        fail("ERROR " + std::to_string(response.status) + ": " + cleanAnswer(message));
-        return;
-    }
-
-    std::string text;
-    if (parsed.is_object() && parsed.contains("content") && parsed["content"].is_array()) {
-        for (const auto& block : parsed["content"]) {
-            if (block.is_object() && block.value("type", "") == "text" && block.contains("text") && block["text"].is_string()) {
-                text += block["text"].get<std::string>();
+        if (parsed.is_object() && parsed.contains("error")) {
+            const auto& err = parsed["error"];
+            if (err.is_object() && err.contains("message") && err["message"].is_string()) {
+                message = err["message"].get<std::string>();
+            } else if (err.is_string()) {
+                message = err.get<std::string>();
             }
         }
+        if (response.status == 401 || response.status == 403) message = "Invalid API key or access denied";
+        if (response.status == 429) message = "Rate limit reached, try again in a moment";
+        error = "ERROR " + std::to_string(response.status) + ": " + cleanAnswer(message);
+        return false;
     }
-    text = cleanAnswer(trimCopy(text));
+
+    std::string out;
+    if (providerInfo(provider).anthropic) {
+        if (parsed.is_object() && parsed.contains("content") && parsed["content"].is_array()) {
+            for (const auto& block : parsed["content"]) {
+                if (block.is_object() && block.value("type", "") == "text" && block.contains("text") && block["text"].is_string()) {
+                    out += block["text"].get<std::string>();
+                }
+            }
+        }
+    } else if (parsed.is_object() && parsed.contains("choices") && parsed["choices"].is_array() && !parsed["choices"].empty()) {
+        const auto& first = parsed["choices"][0];
+        if (first.is_object() && first.contains("message") && first["message"].is_object() &&
+            first["message"].contains("content") && first["message"]["content"].is_string()) {
+            out = first["message"]["content"].get<std::string>();
+        }
+    }
+    text = cleanAnswer(trimCopy(out));
     if (text.empty()) {
-        fail("The AI sent an empty answer");
-        return;
+        error = "The AI sent an empty answer (try another model)";
+        return false;
     }
+    return true;
+}
+
+inline void aiRunJob(const AiJob& job) {
+    auto& a = ai();
+    const Snapshot snap = snapshot();
+    const AiRequest request = buildAiRequest(job, snap);
+    const HttpResult response = httpPostJson(request.url, request.headers, request.body, 10000, 30000);
+
+    std::string text, error;
+    const bool ok = parseAiResponse(job.provider, response, text, error);
     std::lock_guard<std::mutex> lock(a.mutex);
-    a.answer = text;
-    a.error.clear();
+    a.answer = ok ? text : std::string();
+    a.error = ok ? std::string() : error;
     a.answerAt = std::chrono::steady_clock::now();
 }
 
@@ -1811,21 +1866,23 @@ class AiPanel : public Panel {
 public:
     AiPanel()
         : Panel("jarvis.ai", "Jarvis AI",
-                "Ask Claude about your surroundings. Needs your own Anthropic API key and an internet connection.",
+                "Ask an AI about your surroundings. Needs an internet connection and an API key (Groq has a free one).",
                 1000.f, 40.f) {}
 
+    std::string provider = "groq";   // groq (free tier), grok (xAI) or claude (Anthropic)
     std::string apiKey;
-    std::string model = "claude-haiku-5-5";
+    std::string model;               // empty: the provider's default model
     std::string language = "English";
     float showSeconds = 45.f;
     float panelWidth = 340.f;
 
     std::vector<ConfigEntry> entries() const override {
         auto list = Panel::entries();
-        list.push_back({"apiKey", "Anthropic API Key", pl::modmenu::ConfigType::Text, apiKey, "", ""});
+        list.push_back({"provider", "Provider (groq / grok / claude)", pl::modmenu::ConfigType::Text, provider, "", ""});
+        list.push_back({"apiKey", "API Key", pl::modmenu::ConfigType::Text, apiKey, "", ""});
         list.push_back({"scan", "Scan Surroundings (ask Jarvis)", pl::modmenu::ConfigType::Button, "false", "", ""});
         list.push_back({"question", "Ask Jarvis (type a question)", pl::modmenu::ConfigType::Text, "", "", ""});
-        list.push_back({"model", "Model", pl::modmenu::ConfigType::Text, model, "", ""});
+        list.push_back({"model", "Model (empty = default)", pl::modmenu::ConfigType::Text, model, "", ""});
         list.push_back({"language", "Reply Language", pl::modmenu::ConfigType::Text, language, "", ""});
         list.push_back(floatEntry("showSeconds", "Show Answer (seconds)", showSeconds, 5.f, 300.f));
         list.push_back(floatEntry("panelWidth", "Panel Width", panelWidth, 200.f, 700.f));
@@ -1834,8 +1891,9 @@ public:
 
     bool set(const std::string& key, std::string_view value) override {
         if (Panel::set(key, value)) return true;
+        if (key == "provider") { provider = trimCopy(value); if (provider.empty()) provider = "groq"; return true; }
         if (key == "apiKey") { apiKey = trimCopy(value); return true; }
-        if (key == "model") { model = trimCopy(value); if (model.empty()) model = "claude-haiku-5-5"; return true; }
+        if (key == "model") { model = trimCopy(value); return true; }
         if (key == "language") { language = trimCopy(value); return true; }
         if (key == "showSeconds") return parseFloat(value, showSeconds);
         if (key == "panelWidth") return parseFloat(value, panelWidth);
@@ -1854,6 +1912,7 @@ public:
 
     void toJson(nlohmann::json& j) const override {
         Panel::toJson(j);
+        j["provider"] = provider;
         j["apiKey"] = apiKey;
         j["model"] = model;
         j["language"] = language;
@@ -1863,6 +1922,7 @@ public:
 
     void fromJson(const nlohmann::json& j) override {
         Panel::fromJson(j);
+        if (j.contains("provider") && j["provider"].is_string()) provider = j["provider"].get<std::string>();
         if (j.contains("apiKey") && j["apiKey"].is_string()) apiKey = j["apiKey"].get<std::string>();
         if (j.contains("model") && j["model"].is_string()) model = j["model"].get<std::string>();
         if (j.contains("language") && j["language"].is_string()) language = j["language"].get<std::string>();
@@ -1874,8 +1934,9 @@ public:
 
     void submit(const std::string& question) {
         AiJob job;
+        job.provider = provider;
         job.apiKey = apiKey;
-        job.model = model.empty() ? std::string("claude-haiku-5-5") : model;
+        job.model = model;
         job.language = language;
         job.question = question;
         std::string reason;
