@@ -62,6 +62,11 @@ struct Contact {
     bool player = false;
     bool hostile = false;
     std::string type;                     // "cow", "zombie" ... (empty when unknown)
+    std::uintptr_t id = 0;                // actor address, used to follow one mob between scans
+    float approach = 0.f;                 // blocks/s the mob itself moves toward you (hostiles only)
+    float closing = 0.f;                  // blocks/s the distance shrinks (includes your own movement)
+    float eta = -1.f;                     // seconds until it reaches its attack range (-1: unknown)
+    bool chasing = false;                 // a hostile that keeps heading straight for you
     float wx = 0.f, wy = 0.f, wz = 0.f;   // world position of the mob's feet (for the glow boxes)
     float width = 0.6f, height = 1.8f;    // approximate hitbox size
 };
@@ -111,6 +116,7 @@ struct Settings {
     std::atomic<bool> aiNeeds{false};        // the AI panel wants radar + target data
     std::atomic<bool> needGlow{false};       // the Spectral Glow module wants every mob around
     std::atomic<float> glowRange{40.f};
+    std::atomic<float> chaseRange{0.f};      // > 0: scan this far for mobs that chase the player
     std::atomic<float> arFov{70.f};          // vertical field of view shared by the AR overlays
 };
 
@@ -571,6 +577,54 @@ inline std::string entityTypeId(const void* actor) {
     return best;
 }
 
+// How close a hostile has to get before it can hurt you (melee) or start hurting you (ranged).
+inline float attackReach(const std::string& type) {
+    struct Entry { std::string_view name; float reach; };
+    static constexpr Entry table[] = {
+        {"creeper", 3.5f}, {"skeleton", 14.f}, {"stray", 14.f}, {"bogged", 14.f}, {"pillager", 14.f},
+        {"witch", 8.f}, {"blaze", 16.f}, {"ghast", 28.f}, {"evoker", 8.f}, {"shulker", 12.f},
+        {"guardian", 10.f}, {"elder_guardian", 10.f}, {"enderman", 3.f}, {"warden", 3.5f}, {"ravager", 3.f},
+        {"wither", 20.f}, {"ender_dragon", 20.f},
+    };
+    for (const auto& entry : table) {
+        if (entry.name == type) return entry.reach;
+    }
+    return 2.5f;
+}
+
+// Follows hostile mobs between scans to tell which ones are really coming for you.
+struct MobTrack {
+    float wx = 0.f, wz = 0.f, dist = 0.f;
+    float vx = 0.f, vz = 0.f, closing = 0.f, approach = 0.f;
+    float chase = 0.f;   // seconds spent heading straight for the player (decays when it stops)
+    std::chrono::steady_clock::time_point at{};
+};
+
+// Updates the motion estimate of one hostile from its latest position (called once per scan).
+inline void updateTrack(MobTrack& track, float px, float pz, const jsdk::Vec3& me, float dist,
+                        std::chrono::steady_clock::time_point now, float chaseRange) {
+    const float dt = std::chrono::duration<float>(now - track.at).count();
+    const bool fresh = track.at.time_since_epoch().count() == 0 || dt > 1.5f ||
+                       (px - track.wx) * (px - track.wx) + (pz - track.wz) * (pz - track.wz) > 64.f;
+    if (fresh) {
+        track = MobTrack{};
+        track.wx = px; track.wz = pz; track.dist = dist; track.at = now;
+        return;
+    }
+    if (dt < 0.04f) return;
+    track.vx += ((px - track.wx) / dt - track.vx) * 0.5f;
+    track.vz += ((pz - track.wz) / dt - track.vz) * 0.5f;
+    track.closing += ((track.dist - dist) / dt - track.closing) * 0.5f;
+    const float toX = me.x - px, toZ = me.z - pz;
+    const float toLen = std::sqrt(toX * toX + toZ * toZ);
+    const float speed = std::sqrt(track.vx * track.vx + track.vz * track.vz);
+    track.approach = toLen > 0.01f ? (track.vx * toX + track.vz * toZ) / toLen : 0.f;
+    const float limit = chaseRange > 0.f ? chaseRange : 64.f;
+    const bool heading = track.approach > 1.2f && track.approach > 0.65f * speed && dist <= limit;
+    track.chase = heading ? track.chase + dt : std::max(0.f, track.chase - dt * 3.f);
+    track.wx = px; track.wz = pz; track.dist = dist; track.at = now;
+}
+
 inline void scanContacts(jsdk::Player* player, const jsdk::Vec3& me, Snapshot& out) {
     auto& c = core();
     out.contacts.clear();
@@ -584,6 +638,10 @@ inline void scanContacts(jsdk::Player* player, const jsdk::Vec3& me, Snapshot& o
     const unsigned mask = static_cast<unsigned>(c.settings.hostileMask.load());
     const bool showPlayers = c.settings.showPlayers.load();
     const bool showPassive = c.settings.showPassive.load();
+    const float chaseRange = c.settings.chaseRange.load();
+    if (chaseRange > 0.f) range = std::max(range, std::clamp(chaseRange, 8.f, 180.f));
+    static std::unordered_map<void*, MobTrack> tracks;
+    const auto trackNow = std::chrono::steady_clock::now();
 
     jsdk::Vec3 extent{range, range, range};
     ActorVec found = c.fetchNearby(player, &extent, kMobActorType);
@@ -624,11 +682,30 @@ inline void scanContacts(jsdk::Player* player, const jsdk::Vec3& me, Snapshot& o
             if (contact.player) mobSize("player", contact.width, contact.height);
             else if (!contact.type.empty()) mobSize(contact.type, contact.width, contact.height);
 
+            contact.id = reinterpret_cast<std::uintptr_t>(raw);
+            if (contact.hostile) {
+                MobTrack& track = tracks[raw];
+                updateTrack(track, pos.x, pos.z, me, contact.dist, trackNow, chaseRange);
+                contact.approach = track.approach;
+                contact.closing = track.closing;
+                contact.chasing = track.chase > 0.8f;
+                if (contact.chasing) {
+                    const float rate = std::max(track.approach, track.closing);
+                    if (rate > 0.5f) contact.eta = std::max(0.f, (contact.dist - attackReach(contact.type)) / rate);
+                }
+            }
+
             if (contact.hostile) {
                 ++out.hostileCount;
                 if (out.nearestHostile < 0.f || contact.dist < out.nearestHostile) out.nearestHostile = contact.dist;
             }
             out.contacts.push_back(contact);
+        }
+    }
+
+    if (tracks.size() > 200) {
+        for (auto it = tracks.begin(); it != tracks.end();) {
+            it = trackNow - it->second.at > std::chrono::seconds(5) ? tracks.erase(it) : std::next(it);
         }
     }
 
@@ -952,8 +1029,12 @@ struct Threat {
 
 inline Threat assess(const Snapshot& s) {
     if (s.hostileCount <= 0) return {"CLEAR", kGreen, 0};
-    if (s.nearestHostile < 8.f || s.hostileCount >= 4) return {"HIGH", kRed, 3};
-    if (s.nearestHostile < 16.f || s.hostileCount >= 2) return {"ELEVATED", kAmber, 2};
+    float chaser = -1.f;   // nearest hostile that is coming straight for you
+    for (const auto& contact : s.contacts) {
+        if (contact.chasing && (chaser < 0.f || contact.dist < chaser)) chaser = contact.dist;
+    }
+    if (s.nearestHostile < 8.f || s.hostileCount >= 4 || (chaser >= 0.f && chaser < 10.f)) return {"HIGH", kRed, 3};
+    if (s.nearestHostile < 16.f || s.hostileCount >= 2 || (chaser >= 0.f && chaser < 25.f)) return {"ELEVATED", kAmber, 2};
     return {"LOW", kCyan, 1};
 }
 
@@ -1243,18 +1324,27 @@ public:
         // Threat / debug list under the radar (nearest first, max 4).
         struct ListItem { std::string text; std::uint32_t color; };
         std::vector<ListItem> list;
-        for (const auto& c : s.contacts) {
-            if (list.size() >= 4) break;
-            if (!debugCategories && !c.hostile) continue;
-            char buffer[48];
-            if (debugCategories) {
-                std::snprintf(buffer, sizeof(buffer), "%s %.0f m [0x%X]",
-                              c.player ? "PLAYER" : (c.hostile ? "HOSTILE" : "MOB"), c.dist, c.cats);
-            } else {
-                const std::string label = c.type.empty() ? std::string("HOSTILE") : prettify(c.type);
-                std::snprintf(buffer, sizeof(buffer), "%.14s  %.0f m", label.c_str(), c.dist);
+        for (int pass = 0; pass < 2; ++pass) {          // pass 0: chasers first, pass 1: everything else
+            for (const auto& c : s.contacts) {
+                if (list.size() >= 4) break;
+                if ((pass == 0) != c.chasing) continue;
+                if (!debugCategories && !c.hostile) continue;
+                char buffer[48];
+                if (debugCategories) {
+                    std::snprintf(buffer, sizeof(buffer), "%s %.0f m [0x%X]",
+                                  c.player ? "PLAYER" : (c.hostile ? "HOSTILE" : "MOB"), c.dist, c.cats);
+                } else {
+                    const std::string label = c.type.empty() ? std::string("HOSTILE") : prettify(c.type);
+                    if (c.chasing && c.eta >= 0.f) {
+                        std::snprintf(buffer, sizeof(buffer), "%.9s %.0fm CHASE %.0fs", label.c_str(), c.dist, c.eta);
+                    } else if (c.chasing) {
+                        std::snprintf(buffer, sizeof(buffer), "%.9s %.0fm CHASING", label.c_str(), c.dist);
+                    } else {
+                        std::snprintf(buffer, sizeof(buffer), "%.14s  %.0f m", label.c_str(), c.dist);
+                    }
+                }
+                list.push_back({buffer, c.chasing ? kAmber : (c.hostile ? kRed : (c.player ? kWhite : kGreen))});
             }
-            list.push_back({buffer, c.hostile ? kRed : (c.player ? kWhite : kGreen)});
         }
 
         const float width = radius * 2.f + pad * 2.f;
@@ -1310,7 +1400,11 @@ public:
             if (right * right + ahead * ahead > range * range) continue;
             const float bx = cx + right / range * radius;
             const float by = cy - ahead / range * radius;
-            if (c.hostile) {
+            if (c.chasing) {                                   // coming for you: amber dot with a line to you
+                canvas.line(bx, by, cx + (bx - cx) * 0.55f, cy + (by - cy) * 0.55f, 1.6f * sc, argb(0.85f, kAmber));
+                canvas.circle(bx, by, 8.f * sc, argb(0.3f * pulse, kAmber));
+                canvas.circle(bx, by, 4.2f * sc, argb(1.f, kAmber));
+            } else if (c.hostile) {
                 canvas.circle(bx, by, 6.f * sc, argb(0.25f * pulse, kRed));
                 canvas.circle(bx, by, 3.6f * sc, argb(1.f, kRed));
             } else if (c.player) {
@@ -1810,7 +1904,7 @@ public:
             if (right < 0.f || left > surface.width || bottom < 0.f || top > surface.height) continue;
             ++drawn;
 
-            const std::uint32_t color = c.hostile ? kRed : (c.player ? kWhite : kGreen);
+            const std::uint32_t color = c.chasing ? kAmber : (c.hostile ? kRed : (c.player ? kWhite : kGreen));
             const float fade = std::clamp(1.2f - c.dist / std::max(range, 1.f) * 0.5f, 0.45f, 1.f);
 
             // Soft body fill (skipped when the mob is right in your face).
@@ -1835,6 +1929,7 @@ public:
                 if (c.player ? mobMaxHealth("player", maxHp) : (!c.type.empty() && mobMaxHealth(c.type, maxHp))) {
                     text += formatFloat("  HP %.0f", maxHp);
                 }
+                if (c.chasing) text += c.eta >= 0.f ? formatFloat("  CHASING %.0fs", c.eta) : std::string("  CHASING");
                 const float w = textWidth(text, labelSize);
                 const float x = std::clamp((left + right) * 0.5f - w * 0.5f, 4.f, surface.width - w - 4.f);
                 const float y = std::clamp(top - labelSize * 1.5f, 4.f, surface.height - labelSize - 4.f);
@@ -2633,11 +2728,18 @@ public:
     float warnRadius = 24.f;         // hostiles inside this distance trigger a warning
     bool autoInsight = true;         // Jarvis asks the AI by itself when something important happens
     float insightCooldown = 30.f;    // minimum seconds between automatic AI insights
+    bool chaseWarn = true;           // early warning for hostiles that run straight at you
+    float chaseRadius = 40.f;        // how far away a chaser is reported
     std::string quickQuestion = "What am I looking at, and what should I do?";   // sent by the Ask Jarvis button
 
-    bool wantsGameData() const { return enabled && (autoReport || autoInsight); }
+    bool wantsGameData() const { return enabled && (autoReport || autoInsight || chaseWarn); }
 
-    void onEnabledChanged() override { core().settings.aiNeeds = wantsGameData(); }
+    void pushNeeds() {
+        core().settings.aiNeeds = wantsGameData();
+        core().settings.chaseRange = (enabled && chaseWarn) ? chaseRadius : 0.f;
+    }
+
+    void onEnabledChanged() override { pushNeeds(); }
 
     std::vector<ConfigEntry> entries() const override {
         auto list = Panel::entries();
@@ -2651,6 +2753,8 @@ public:
         list.push_back(toggleEntry("autoReport", "Auto Report Mobs", autoReport));
         list.push_back(toggleEntry("autoInsight", "Auto AI Insights (proactive)", autoInsight));
         list.push_back(floatEntry("insightCooldown", "Insight Cooldown (seconds)", insightCooldown, 10.f, 180.f));
+        list.push_back(toggleEntry("chaseWarn", "Early Chase Warning", chaseWarn));
+        list.push_back(floatEntry("chaseRadius", "Chase Warning Range (blocks)", chaseRadius, 15.f, 80.f));
         list.push_back(toggleEntry("voice", "Voice (speak aloud)", voice));
         list.push_back({"voiceLang", "Voice Language (en-US / id-ID)", pl::modmenu::ConfigType::Text, voiceLang, "", ""});
         list.push_back(floatEntry("warnRadius", "Warning Radius", warnRadius, 8.f, 80.f));
@@ -2669,15 +2773,25 @@ public:
         if (key == "panelWidth") return parseFloat(value, panelWidth);
         if (key == "autoReport") {
             const bool ok = parseBool(value, autoReport);
-            core().settings.aiNeeds = wantsGameData();
+            pushNeeds();
             return ok;
         }
         if (key == "autoInsight") {
             const bool ok = parseBool(value, autoInsight);
-            core().settings.aiNeeds = wantsGameData();
+            pushNeeds();
             return ok;
         }
         if (key == "insightCooldown") return parseFloat(value, insightCooldown);
+        if (key == "chaseWarn") {
+            const bool ok = parseBool(value, chaseWarn);
+            pushNeeds();
+            return ok;
+        }
+        if (key == "chaseRadius") {
+            const bool ok = parseFloat(value, chaseRadius);
+            pushNeeds();
+            return ok;
+        }
         if (key == "quickQuestion") {
             quickQuestion = trimCopy(value);
             if (quickQuestion.empty()) quickQuestion = "What am I looking at, and what should I do?";
@@ -2713,6 +2827,8 @@ public:
         j["warnRadius"] = warnRadius;
         j["autoInsight"] = autoInsight;
         j["insightCooldown"] = insightCooldown;
+        j["chaseWarn"] = chaseWarn;
+        j["chaseRadius"] = chaseRadius;
         j["quickQuestion"] = quickQuestion;
     }
 
@@ -2730,10 +2846,12 @@ public:
         if (j.contains("warnRadius")) warnRadius = j["warnRadius"].get<float>();
         if (j.contains("autoInsight")) autoInsight = j["autoInsight"].get<bool>();
         if (j.contains("insightCooldown")) insightCooldown = j["insightCooldown"].get<float>();
+        if (j.contains("chaseWarn")) chaseWarn = j["chaseWarn"].get<bool>();
+        if (j.contains("chaseRadius")) chaseRadius = j["chaseRadius"].get<float>();
         if (j.contains("quickQuestion") && j["quickQuestion"].is_string() && !j["quickQuestion"].get<std::string>().empty()) {
             quickQuestion = j["quickQuestion"].get<std::string>();
         }
-        core().settings.aiNeeds = wantsGameData();
+        pushNeeds();
     }
 
     void scan() { submit({}); }
@@ -2763,7 +2881,7 @@ public:
             pending.clear();
             submit(question);
         }
-        if (autoReport || autoInsight) autoReports(s, now);
+        if (autoReport || autoInsight || chaseWarn) autoReports(s, now);
 
         auto& a = ai();
         const bool busy = a.busy.load();
@@ -3074,6 +3192,58 @@ private:
         }
         lastHostileCount = count;
 
+        // 4) Early warning for hostiles that run straight at the player.
+        if (chaseWarn) {
+            const Contact* chaser = nullptr;
+            int chasers = 0;
+            for (const auto& contact : s.contacts) {
+                if (!contact.chasing || contact.dist > chaseRadius) continue;
+                ++chasers;
+                if (!chaser || contact.dist < chaser->dist) chaser = &contact;
+            }
+            if (chaser && now - lastChaseAnnounce > std::chrono::seconds(3)) {
+                auto& last = chaseWarned[chaser->id];
+                if (last.time_since_epoch().count() == 0 || now - last > std::chrono::seconds(25)) {
+                    last = now;
+                    lastChaseAnnounce = now;
+                    const std::string name = chaser->type.empty() ? std::string(indo ? "Musuh" : "Hostile")
+                                                                  : capitalised(lowerName(chaser->type));
+                    const std::string where = direction(relativeName(chaser->dx, chaser->dz, s.yaw), indo);
+                    char text[240];
+                    char eta[64];
+                    if (chaser->eta < 0.f) {
+                        std::snprintf(eta, sizeof(eta), "%s", indo ? "Segera." : "Closing fast.");
+                    } else if (chaser->eta < 1.5f) {
+                        std::snprintf(eta, sizeof(eta), "%s", indo ? "Sebentar lagi kena!" : "Contact imminent!");
+                    } else {
+                        std::snprintf(eta, sizeof(eta), indo ? "Kontak %.0f detik." : "Contact in %.0f seconds.", chaser->eta);
+                    }
+                    if (chasers > 1) {
+                        std::snprintf(text, sizeof(text),
+                                      indo ? "Peringatan. %d musuh mengejarmu. Terdekat: %s, %s, %.0f meter. %s"
+                                           : "Warning. %d hostiles chasing you. Nearest: %s, %s, %.0f meters. %s",
+                                      chasers, name.c_str(), where.c_str(), chaser->dist, eta);
+                    } else {
+                        std::snprintf(text, sizeof(text),
+                                      indo ? "Peringatan. %s mengejarmu, %s, %.0f meter. %s"
+                                           : "Warning. %s chasing you, %s, %.0f meters. %s",
+                                      name.c_str(), where.c_str(), chaser->dist, eta);
+                    }
+                    announce(text, true);
+
+                    char hint[260];
+                    std::snprintf(hint, sizeof(hint), "%s has started chasing the player: %.0f meters away, %s, %s",
+                                  name.c_str(), chaser->dist, relativeName(chaser->dx, chaser->dz, s.yaw), eta);
+                    queueInsight(hint, true, now);
+                }
+            }
+            if (chaseWarned.size() > 64) {
+                for (auto it = chaseWarned.begin(); it != chaseWarned.end();) {
+                    it = now - it->second > std::chrono::seconds(60) ? chaseWarned.erase(it) : std::next(it);
+                }
+            }
+        }
+
         flushInsight(now);
     }
 
@@ -3087,6 +3257,9 @@ private:
     Clock::time_point lastTargetReport{};
     Clock::time_point lastThreatReport{};
     int lastHostileCount = 0;
+
+    std::map<std::uintptr_t, Clock::time_point> chaseWarned;
+    Clock::time_point lastChaseAnnounce{};
 
     static constexpr int kMaxInsights = 200;   // per session; keeps free-tier quotas safe
     std::string pendingHint;
@@ -3323,6 +3496,7 @@ inline void stop() {
     detail::aiShutdown();
     detail::voiceShutdown();
     detail::core().settings.aiNeeds = false;
+    detail::core().settings.chaseRange = 0.f;
     detail::core().settings.needGlow = false;
     for (auto& panel : c.panels) panel->clear();
     detail::saveConfig();
