@@ -23,11 +23,16 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <map>
 #include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <cstring>
+#include <fcntl.h>
+#include <set>
+#include <unistd.h>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -56,6 +61,7 @@ struct Contact {
     unsigned cats = 0;                    // raw Actor category bits (for calibration)
     bool player = false;
     bool hostile = false;
+    std::string type;                     // "cow", "zombie" ... (empty when unknown)
 };
 
 struct Target {
@@ -66,6 +72,7 @@ struct Target {
     bool hostile = false;
     bool player = false;
     unsigned cats = 0;
+    std::string type;      // entity id without namespace, empty when unknown
     bool hasBox = false;   // world-space bounding box of the target (for the AR overlay)
     float minX = 0.f, minY = 0.f, minZ = 0.f;
     float maxX = 0.f, maxY = 0.f, maxZ = 0.f;
@@ -98,6 +105,8 @@ struct Settings {
     std::atomic<bool> showPlayers{true};
     std::atomic<bool> showPassive{true};
     std::atomic<float> entityHeight{1.8f};   // assumed mob height for the AR box
+    std::atomic<bool> debug{false};          // show calibration info (radar "Debug Categories")
+    std::atomic<bool> aiNeeds{false};        // the AI panel wants radar + target data
 };
 
 namespace detail {
@@ -220,6 +229,276 @@ inline void bindSignatures() {
 // World scanning (runs on the local player tick)
 // ===========================================================================
 
+// ---------------------------------------------------------------------------
+// Entity type names ("cow", "zombie"), discovered at runtime
+// ---------------------------------------------------------------------------
+//
+// There is no signature for "what kind of mob is this", so the actor's memory is searched for
+// an identifier string such as "minecraft:cow" (directly inside the actor or one pointer
+// away). Once the same location has produced two different names on two different mobs it
+// is trusted and reused, which makes later lookups cheap.
+
+inline constexpr std::string_view kKnownMobs[] = {
+    "allay", "armadillo", "axolotl", "bat", "bee", "blaze", "bogged", "breeze", "camel", "cat", "cave_spider",
+    "chicken", "cod", "cow", "creaking", "creeper", "dolphin", "donkey", "drowned", "elder_guardian", "enderman",
+    "endermite", "ender_dragon", "evoker", "fox", "frog", "ghast", "glow_squid", "goat", "guardian", "hoglin",
+    "horse", "husk", "iron_golem", "llama", "magma_cube", "mooshroom", "mule", "ocelot", "panda", "parrot",
+    "phantom", "pig", "piglin", "piglin_brute", "pillager", "polar_bear", "pufferfish", "rabbit", "ravager",
+    "salmon", "sheep", "shulker", "silverfish", "skeleton", "skeleton_horse", "slime", "sniffer", "snow_golem",
+    "spider", "squid", "stray", "strider", "tadpole", "trader_llama", "tropicalfish", "turtle", "vex",
+    "villager", "villager_v2", "vindicator", "wandering_trader", "warden", "witch", "wither",
+    "wither_skeleton", "wolf", "zoglin", "zombie", "zombie_horse", "zombie_villager", "zombie_villager_v2",
+    "zombie_pigman", "zombified_piglin", "player"};
+
+inline constexpr std::string_view kHostileMobs[] = {
+    "blaze", "bogged", "breeze", "cave_spider", "creaking", "creeper", "drowned", "elder_guardian", "endermite",
+    "ender_dragon", "evoker", "ghast", "guardian", "hoglin", "husk", "magma_cube", "phantom", "piglin_brute",
+    "pillager", "ravager", "shulker", "silverfish", "skeleton", "slime", "spider", "stray", "vex", "vindicator",
+    "warden", "witch", "wither", "wither_skeleton", "zoglin", "zombie", "zombie_villager", "zombie_villager_v2"};
+
+struct MobSize { std::string_view name; float width; float height; };
+inline constexpr MobSize kMobSizes[] = {
+    {"cow", 0.9f, 1.4f}, {"mooshroom", 0.9f, 1.4f}, {"pig", 0.9f, 0.9f}, {"sheep", 0.9f, 1.3f},
+    {"chicken", 0.4f, 0.7f}, {"zombie", 0.6f, 1.95f}, {"husk", 0.6f, 1.95f}, {"drowned", 0.6f, 1.95f},
+    {"skeleton", 0.6f, 1.99f}, {"stray", 0.6f, 1.99f}, {"creeper", 0.6f, 1.7f}, {"spider", 1.4f, 0.9f},
+    {"cave_spider", 0.7f, 0.5f}, {"enderman", 0.6f, 2.9f}, {"villager", 0.6f, 1.95f}, {"villager_v2", 0.6f, 1.95f},
+    {"witch", 0.6f, 1.95f}, {"horse", 1.4f, 1.6f}, {"donkey", 1.4f, 1.6f}, {"wolf", 0.6f, 0.85f},
+    {"cat", 0.6f, 0.7f}, {"rabbit", 0.4f, 0.5f}, {"bat", 0.5f, 0.9f}, {"iron_golem", 1.4f, 2.7f},
+    {"blaze", 0.6f, 1.8f}, {"ghast", 4.0f, 4.0f}, {"phantom", 0.9f, 0.5f}, {"squid", 0.8f, 0.8f},
+    {"slime", 0.52f, 0.52f}, {"silverfish", 0.4f, 0.3f}, {"fox", 0.6f, 0.7f}, {"player", 0.6f, 1.8f},
+};
+
+template <std::size_t N>
+inline bool inList(const std::string_view (&list)[N], std::string_view value) {
+    for (const auto& entry : list) {
+        if (entry == value) return true;
+    }
+    return false;
+}
+
+inline bool isHostileType(std::string_view type) { return inList(kHostileMobs, type); }
+
+inline bool mobSize(std::string_view type, float& width, float& height) {
+    for (const auto& entry : kMobSizes) {
+        if (entry.name == type) {
+            width = entry.width;
+            height = entry.height;
+            return true;
+        }
+    }
+    return false;
+}
+
+// Reads memory without risking a crash: write() reports EFAULT instead of faulting.
+inline std::size_t readMemory(const void* source, void* destination, std::size_t size) {
+    static int fds[2] = {-1, -1};
+    static bool broken = false;
+    if (broken || !source || !destination || size == 0) return 0;
+    if (fds[0] < 0 && pipe2(fds, O_NONBLOCK | O_CLOEXEC) != 0) {
+        broken = true;
+        return 0;
+    }
+    std::size_t total = 0;
+    while (total < size) {
+        const std::size_t chunk = std::min<std::size_t>(size - total, 1024);
+        const ssize_t written = write(fds[1], static_cast<const char*>(source) + total, chunk);
+        if (written <= 0) break;
+        std::size_t drained = 0;
+        while (drained < static_cast<std::size_t>(written)) {
+            const ssize_t got = read(fds[0], static_cast<char*>(destination) + total + drained,
+                                     static_cast<std::size_t>(written) - drained);
+            if (got <= 0) return total + drained;
+            drained += static_cast<std::size_t>(got);
+        }
+        total += drained;
+        if (static_cast<std::size_t>(written) < chunk) break;
+    }
+    return total;
+}
+
+inline bool looksLikeIdentifier(const std::string& text) {
+    if (text.size() < 5 || text.size() > 48) return false;
+    std::size_t colon = std::string::npos;
+    for (std::size_t i = 0; i < text.size(); ++i) {
+        const char ch = text[i];
+        if (ch == ':') {
+            if (colon != std::string::npos || i == 0 || i + 1 == text.size()) return false;
+            colon = i;
+        } else if (!((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '_' || ch == '.' || ch == '-')) {
+            return false;
+        }
+    }
+    return colon != std::string::npos;
+}
+
+// Decodes a libc++ std::string stored at `block` (24 bytes).
+inline bool readStdString(const unsigned char* block, std::string& out) {
+    const unsigned char first = block[0];
+    if ((first & 1u) == 0) {   // short string, characters follow the size byte
+        const std::size_t size = first >> 1;
+        if (size < 5 || size > 22) return false;
+        out.assign(reinterpret_cast<const char*>(block + 1), size);
+        return true;
+    }
+    std::uint64_t size = 0, pointer = 0;
+    std::memcpy(&size, block + 8, 8);
+    std::memcpy(&pointer, block + 16, 8);
+    if (size < 5 || size > 48 || pointer < 0x10000 || pointer > 0x0000FFFFFFFFFFFFull) return false;
+    char buffer[64];
+    if (readMemory(reinterpret_cast<const void*>(pointer), buffer, static_cast<std::size_t>(size)) != size) return false;
+    out.assign(buffer, static_cast<std::size_t>(size));
+    return true;
+}
+
+struct TypePath {
+    int pointerOffset = -1;   // -1: the string lives inside the actor itself
+    int stringOffset = 0;
+};
+
+struct TypeFinder {
+    std::vector<TypePath> candidates;
+    std::vector<std::set<std::string>> seen;
+    std::vector<bool> knownHit;
+    int confirmed = -1;
+    int evaluations = 0;
+    std::chrono::steady_clock::time_point lastDiscovery{};
+    std::string debug;
+};
+
+inline TypeFinder& typeFinder() {
+    static TypeFinder finder;
+    return finder;
+}
+
+inline std::string stripNamespace(const std::string& id) {
+    const auto colon = id.find(':');
+    return colon == std::string::npos ? id : id.substr(colon + 1);
+}
+
+inline bool evalTypePath(const void* actor, const TypePath& path, std::string& out) {
+    unsigned char block[24];
+    if (path.pointerOffset < 0) {
+        if (readMemory(static_cast<const char*>(actor) + path.stringOffset, block, 24) != 24) return false;
+    } else {
+        std::uint64_t pointer = 0;
+        if (readMemory(static_cast<const char*>(actor) + path.pointerOffset, &pointer, 8) != 8) return false;
+        if (pointer < 0x10000 || pointer > 0x0000FFFFFFFFFFFFull || (pointer & 7u) != 0) return false;
+        if (readMemory(reinterpret_cast<const char*>(pointer) + path.stringOffset, block, 24) != 24) return false;
+    }
+    std::string value;
+    if (!readStdString(block, value) || !looksLikeIdentifier(value)) return false;
+    out = std::move(value);
+    return true;
+}
+
+inline void discoverTypePaths(const void* actor) {
+    auto& finder = typeFinder();
+    struct Hit { TypePath path; std::string value; };
+    std::vector<Hit> hits;
+
+    auto scan = [&](const unsigned char* data, std::size_t length, int pointerOffset) {
+        for (std::size_t off = 0; off + 24 <= length && hits.size() < 64; off += 8) {
+            std::string value;
+            if (readStdString(data + off, value) && looksLikeIdentifier(value)) {
+                hits.push_back({{pointerOffset, static_cast<int>(off)}, value});
+            }
+        }
+    };
+
+    std::vector<unsigned char> body(0x800);
+    const std::size_t bodySize = readMemory(actor, body.data(), body.size());
+    scan(body.data(), bodySize, -1);
+
+    std::vector<unsigned char> target(0x300);
+    int dereferenced = 0;
+    for (std::size_t off = 0; off + 8 <= std::min<std::size_t>(bodySize, 0x600) && dereferenced < 220; off += 8) {
+        std::uint64_t pointer = 0;
+        std::memcpy(&pointer, body.data() + off, 8);
+        if (pointer < 0x10000 || pointer > 0x0000FFFFFFFFFFFFull || (pointer & 7u) != 0) continue;
+        ++dereferenced;
+        const std::size_t got = readMemory(reinterpret_cast<const void*>(pointer), target.data(), target.size());
+        if (got >= 24) scan(target.data(), got, static_cast<int>(off));
+    }
+
+    // Prefer locations that produced a real mob name; otherwise anything in the minecraft namespace.
+    std::vector<Hit> keep;
+    for (const auto& hit : hits) {
+        if (inList(kKnownMobs, stripNamespace(hit.value))) keep.push_back(hit);
+    }
+    if (keep.empty()) {
+        for (const auto& hit : hits) {
+            if (hit.value.rfind("minecraft:", 0) == 0) keep.push_back(hit);
+        }
+    }
+    if (keep.size() > 24) keep.resize(24);
+
+    finder.candidates.clear();
+    finder.seen.clear();
+    finder.knownHit.clear();
+    finder.confirmed = -1;
+    finder.evaluations = 0;
+    for (const auto& hit : keep) {
+        finder.candidates.push_back(hit.path);
+        finder.seen.emplace_back();
+        finder.knownHit.push_back(false);
+    }
+}
+
+// Returns the entity id without namespace ("cow"), or an empty string when it is not known.
+inline std::string entityTypeId(const void* actor) {
+    auto& finder = typeFinder();
+    if (!actor) return {};
+    std::string value;
+
+    if (finder.confirmed >= 0) {
+        if (evalTypePath(actor, finder.candidates[static_cast<std::size_t>(finder.confirmed)], value)) {
+            return stripNamespace(value);
+        }
+        return {};
+    }
+
+    if (finder.candidates.empty()) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now - finder.lastDiscovery < std::chrono::seconds(1)) return {};
+        finder.lastDiscovery = now;
+        discoverTypePaths(actor);
+        if (finder.candidates.empty()) return {};
+    }
+
+    ++finder.evaluations;
+    std::string best;
+    for (std::size_t i = 0; i < finder.candidates.size(); ++i) {
+        if (!evalTypePath(actor, finder.candidates[i], value)) continue;
+        const std::string name = stripNamespace(value);
+        finder.seen[i].insert(name);
+        const bool known = inList(kKnownMobs, name);
+        if (known) finder.knownHit[i] = true;
+        if (best.empty() || (known && !inList(kKnownMobs, best))) best = name;
+        if (finder.seen[i].size() >= 2 && finder.knownHit[i]) {
+            finder.confirmed = static_cast<int>(i);
+            break;
+        }
+    }
+    // Only one kind of mob around for a long time: settle on the first location that gave a real name.
+    if (finder.confirmed < 0 && finder.evaluations > 80) {
+        for (std::size_t i = 0; i < finder.candidates.size(); ++i) {
+            if (finder.knownHit[i]) { finder.confirmed = static_cast<int>(i); break; }
+        }
+    }
+    if (finder.confirmed >= 0) {
+        const TypePath& path = finder.candidates[static_cast<std::size_t>(finder.confirmed)];
+        char text[64];
+        if (path.pointerOffset >= 0) {
+            std::snprintf(text, sizeof(text), "ID: ptr +0x%X > +0x%X", path.pointerOffset, path.stringOffset);
+        } else {
+            std::snprintf(text, sizeof(text), "ID: direct +0x%X", path.stringOffset);
+        }
+        finder.debug = text;
+        if (evalTypePath(actor, path, value)) return stripNamespace(value);
+    }
+    return best;
+}
+
 inline void scanContacts(jsdk::Player* player, const jsdk::Vec3& me, Snapshot& out) {
     auto& c = core();
     out.contacts.clear();
@@ -254,7 +533,9 @@ inline void scanContacts(jsdk::Player* player, const jsdk::Vec3& me, Snapshot& o
             contact.player = c.isPlayer ? c.isPlayer(raw) : false;
             contact.cats = actor->categories();
             if (!contact.player && (contact.cats & kCategoryMob) == 0) continue;   // items, arrows, xp ...
-            contact.hostile = !contact.player && (contact.cats & mask) != 0;
+            if (!contact.player) contact.type = entityTypeId(raw);
+            contact.hostile = !contact.player &&
+                              (contact.type.empty() ? (contact.cats & mask) != 0 : isHostileType(contact.type));
 
             if (contact.player && !showPlayers) continue;
             if (!contact.player && !contact.hostile && !showPassive) continue;
@@ -336,18 +617,24 @@ inline void scanTarget(jsdk::Player* player, Target& out) {
         out.dist = length;
         out.cats = actor->categories();
         out.player = c.isPlayer ? c.isPlayer(raw) : false;
-        out.hostile = !out.player && (out.cats & static_cast<unsigned>(c.settings.hostileMask.load())) != 0;
+        if (!out.player) out.type = entityTypeId(raw);
+        out.hostile = !out.player &&
+                      (out.type.empty() ? (out.cats & static_cast<unsigned>(c.settings.hostileMask.load())) != 0
+                                        : isHostileType(out.type));
 
-        // The stored position sits at eye level (the local player's does), so put the feet
-        // about 90% of the height below it. Width is a flat 0.6 for every mob.
+        // A mob's stored position is at its feet (a player's is at eye level, 1.62 blocks up).
         const jsdk::Vec3 at = actor->position();
         if (finite3(at)) {
-            const float height = std::clamp(c.settings.entityHeight.load(), 0.3f, 6.f);
+            float width = 0.6f;
+            float height = std::clamp(c.settings.entityHeight.load(), 0.3f, 6.f);
+            if (!out.type.empty()) mobSize(out.type, width, height);
+            if (out.player) mobSize("player", width, height);
+            const float feet = out.player ? at.y - 1.62f : at.y;
             out.hasBox = true;
-            out.minX = at.x - 0.3f; out.maxX = at.x + 0.3f;
-            out.minZ = at.z - 0.3f; out.maxZ = at.z + 0.3f;
-            out.minY = at.y - height * 0.9f;
-            out.maxY = out.minY + height;
+            out.minX = at.x - width * 0.5f; out.maxX = at.x + width * 0.5f;
+            out.minZ = at.z - width * 0.5f; out.maxZ = at.z + width * 0.5f;
+            out.minY = feet;
+            out.maxY = feet + height;
         }
         return;
     }
@@ -407,8 +694,9 @@ inline void onTick(jsdk::Player* player) {
     };
 
     Snapshot scratch;
-    const bool doRadar = c.settings.needRadar.load() && due(c.lastRadar, kScanIntervalMs);
-    const bool doTarget = c.settings.needScanner.load() && due(c.lastTarget, kTargetIntervalMs);
+    const bool aiWants = c.settings.aiNeeds.load();
+    const bool doRadar = (c.settings.needRadar.load() || aiWants) && due(c.lastRadar, kScanIntervalMs);
+    const bool doTarget = (c.settings.needScanner.load() || aiWants) && due(c.lastTarget, kTargetIntervalMs);
     if (doRadar) scanContacts(player, pos, scratch);
     if (doTarget) {
         scanTarget(player, scratch.target);
@@ -863,6 +1151,7 @@ public:
         const float pad = 10.f * sc;
         const float radius = 72.f * sc;
         const float range = std::clamp(radarRange, 8.f, 180.f);
+        core().settings.debug = debugCategories;
         const Threat threat = assess(s);
 
         // Threat / debug list under the radar (nearest first, max 4).
@@ -876,7 +1165,8 @@ public:
                 std::snprintf(buffer, sizeof(buffer), "%s %.0f m [0x%X]",
                               c.player ? "PLAYER" : (c.hostile ? "HOSTILE" : "MOB"), c.dist, c.cats);
             } else {
-                std::snprintf(buffer, sizeof(buffer), "HOSTILE  %.0f m", c.dist);
+                const std::string label = c.type.empty() ? std::string("HOSTILE") : prettify(c.type);
+                std::snprintf(buffer, sizeof(buffer), "%.14s  %.0f m", label.c_str(), c.dist);
             }
             list.push_back({buffer, c.hostile ? kRed : (c.player ? kWhite : kGreen)});
         }
@@ -1280,7 +1570,9 @@ private:
         } else {
             const char* cls = t.player ? "PLAYER" : (t.hostile ? "HOSTILE" : "MOB");
             const std::uint32_t color = t.player ? kWhite : (t.hostile ? kRed : kGreen);
-            topLeft.push_back({cls, color});
+            topLeft.push_back({t.type.empty() ? std::string(cls) : prettify(t.type), color});
+            if (!t.type.empty() && t.hostile) topLeft.push_back({"HOSTILE", kRed});
+            if (core().settings.debug.load()) topLeft.push_back({typeFinder().debug.empty() ? std::string("ID: searching") : typeFinder().debug, kCyanDim});
             topLeft.push_back({formatFloat("RANGE %.1f m", t.dist), kCyan});
             topRight.push_back({"HEALTH N/A", kCyanDim});
             if (t.hostile) bottomRight.push_back({"THREAT: ENGAGE?", kRed});
@@ -1554,7 +1846,10 @@ inline std::string buildState(const Snapshot& s) {
     int listed = 0;
     for (const auto& contact : s.contacts) {
         if (listed >= 12) break;
-        const char* kind = contact.player ? "PLAYER" : (contact.hostile ? "HOSTILE" : "PASSIVE");
+        const std::string kindText = contact.type.empty()
+            ? std::string(contact.player ? "PLAYER" : (contact.hostile ? "HOSTILE" : "PASSIVE"))
+            : prettify(contact.type) + (contact.hostile ? " (hostile)" : "");
+        const char* kind = kindText.c_str();
         const char* vertical = contact.dy > 3.f ? ", above you" : (contact.dy < -3.f ? ", below you" : "");
         std::snprintf(line, sizeof(line), "- %s, %.0f m, %s (%s)%s\n", kind, contact.dist,
                       relativeName(contact.dx, contact.dz, s.yaw), compassName(contact.dx, contact.dz), vertical);
@@ -1568,8 +1863,9 @@ inline std::string buildState(const Snapshot& s) {
         std::snprintf(line, sizeof(line), "block %s, %.1f m\n", s.target.name.c_str(), s.target.dist);
         out += line;
     } else if (s.target.kind == Target::Kind::Entity) {
-        std::snprintf(line, sizeof(line), "%s, %.1f m\n",
-                      s.target.player ? "player" : (s.target.hostile ? "hostile mob" : "mob"), s.target.dist);
+        const std::string who = !s.target.type.empty() ? prettify(s.target.type)
+                                : (s.target.player ? "player" : (s.target.hostile ? "hostile mob" : "mob"));
+        std::snprintf(line, sizeof(line), "%s%s, %.1f m\n", who.c_str(), s.target.hostile ? " (hostile)" : "", s.target.dist);
         out += line;
     } else {
         out += "nothing\n";
@@ -1595,10 +1891,35 @@ inline std::string buildState(const Snapshot& s) {
 inline std::string cleanAnswer(const std::string& text) {
     std::string out;
     out.reserve(text.size());
-    for (unsigned char ch : text) {
+    for (std::size_t i = 0; i < text.size(); ++i) {
+        const unsigned char ch = static_cast<unsigned char>(text[i]);
         if (ch == '\r' || ch == '*' || ch == '#' || ch == '`') continue;
-        if (ch == '\n' || (ch >= 32 && ch < 127)) out.push_back(static_cast<char>(ch));
-        else if (ch >= 0x80) { if ((ch & 0xC0) != 0x80) out.push_back('?'); }   // one '?' per UTF-8 character
+        if (ch == '\n' || (ch >= 32 && ch < 127)) {
+            out.push_back(static_cast<char>(ch));
+            continue;
+        }
+        if (ch < 0x80) continue;
+        if ((ch & 0xC0) == 0x80) continue;   // stray continuation byte
+
+        // Decode one UTF-8 character and map the common typographic ones to ASCII.
+        std::size_t length = (ch & 0xE0) == 0xC0 ? 2 : ((ch & 0xF0) == 0xE0 ? 3 : 4);
+        std::uint32_t cp = length == 2 ? (ch & 0x1Fu) : (length == 3 ? (ch & 0x0Fu) : (ch & 0x07u));
+        std::size_t used = 1;
+        while (used < length && i + used < text.size() &&
+               (static_cast<unsigned char>(text[i + used]) & 0xC0) == 0x80) {
+            cp = (cp << 6) | (static_cast<unsigned char>(text[i + used]) & 0x3Fu);
+            ++used;
+        }
+        i += used - 1;
+        if (cp == 0xA0 || cp == 0x202F || cp == 0x2009 || cp == 0x200A || cp == 0x2007) out.push_back(' ');
+        else if (cp == 0x200B || cp == 0x200C || cp == 0x200D || cp == 0xFEFF) continue;
+        else if (cp == 0x2013 || cp == 0x2014 || cp == 0x2212) out.push_back('-');
+        else if (cp == 0x2018 || cp == 0x2019) out.push_back('\'');
+        else if (cp == 0x201C || cp == 0x201D) out.push_back('"');
+        else if (cp == 0x2026) out += "...";
+        else if (cp == 0x2192) out += "->";
+        else if (cp == 0x2022) out.push_back('-');
+        else out.push_back('?');
     }
     return out;
 }
@@ -1612,12 +1933,172 @@ inline std::string trimCopy(std::string_view value) {
 
 // ---- background worker -----------------------------------------------------
 
+// ---- text to speech (android.speech.tts.TextToSpeech through JNI) ----------
+
+struct VoiceService {
+    std::mutex mutex;
+    std::condition_variable wake;
+    std::thread worker;
+    bool stop = false;
+    bool hasText = false;
+    std::string text;
+    std::string language;
+    std::string error;   // guarded by mutex
+};
+
+inline VoiceService& voiceService() {
+    static VoiceService instance;
+    return instance;
+}
+
+inline std::string voiceError() {
+    auto& v = voiceService();
+    std::lock_guard<std::mutex> lock(v.mutex);
+    return v.error;
+}
+
+inline void voiceLoop() {
+    auto& v = voiceService();
+    auto setError = [&](const std::string& message) {
+        std::lock_guard<std::mutex> lock(v.mutex);
+        v.error = message;
+    };
+
+    JavaVM* vm = findJavaVm();
+    if (!vm) { setError("VOICE: Java runtime not reachable"); return; }
+    JNIEnv* env = nullptr;
+    bool attached = false;
+    const jint envStatus = vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6);
+    if (envStatus == JNI_EDETACHED) {
+        if (attachCurrentThread(vm, &env) != JNI_OK || !env) { setError("VOICE: could not attach to Java"); return; }
+        attached = true;
+    } else if (envStatus != JNI_OK || !env) {
+        setError("VOICE: Java runtime not available");
+        return;
+    }
+
+    jobject tts = nullptr;                        // global reference
+    std::string currentLanguage;
+    std::chrono::steady_clock::time_point readyAt{};
+
+    auto speakOnce = [&](const std::string& text, const std::string& language) {
+        auto failed = [&](const char* step) {
+            if (!env->ExceptionCheck()) return false;
+            setError(std::string("VOICE ") + step + ": " + takeJavaException(env));
+            return true;
+        };
+
+        if (!tts) {
+            jclass threadClass = env->FindClass("android/app/ActivityThread");
+            if (failed("context") || !threadClass) { setError("VOICE: no Android context"); return; }
+            jmethodID currentApplication = env->GetStaticMethodID(threadClass, "currentApplication", "()Landroid/app/Application;");
+            if (failed("context") || !currentApplication) { setError("VOICE: no Android context"); return; }
+            jobject application = env->CallStaticObjectMethod(threadClass, currentApplication);
+            if (failed("context") || !application) { setError("VOICE: no Android context"); return; }
+            jclass ttsClass = env->FindClass("android/speech/tts/TextToSpeech");
+            if (failed("engine") || !ttsClass) { setError("VOICE: no text-to-speech engine class"); return; }
+            jmethodID constructor = env->GetMethodID(ttsClass, "<init>",
+                                                     "(Landroid/content/Context;Landroid/speech/tts/TextToSpeech$OnInitListener;)V");
+            if (failed("engine") || !constructor) { setError("VOICE: no text-to-speech engine"); return; }
+            jobject created = env->NewObject(ttsClass, constructor, application, static_cast<jobject>(nullptr));
+            if (failed("engine") || !created) { setError("VOICE: could not start text-to-speech"); return; }
+            tts = env->NewGlobalRef(created);
+            readyAt = std::chrono::steady_clock::now() + std::chrono::milliseconds(1500);
+            currentLanguage.clear();
+        }
+
+        const auto now = std::chrono::steady_clock::now();
+        if (now < readyAt) std::this_thread::sleep_for(readyAt - now);
+
+        jclass ttsClass = env->GetObjectClass(tts);
+        jclass localeClass = env->FindClass("java/util/Locale");
+        jmethodID forTag = localeClass ? env->GetStaticMethodID(localeClass, "forLanguageTag", "(Ljava/lang/String;)Ljava/util/Locale;") : nullptr;
+        jmethodID setLanguage = env->GetMethodID(ttsClass, "setLanguage", "(Ljava/util/Locale;)I");
+        jmethodID speak = env->GetMethodID(ttsClass, "speak", "(Ljava/lang/CharSequence;ILandroid/os/Bundle;Ljava/lang/String;)I");
+        if (failed("methods") || !forTag || !setLanguage || !speak) { setError("VOICE: text-to-speech API missing"); return; }
+
+        jint languageResult = 0;
+        for (int attempt = 0; attempt < 5; ++attempt) {
+            if (currentLanguage != language) {
+                jobject locale = env->CallStaticObjectMethod(localeClass, forTag, env->NewStringUTF(language.c_str()));
+                if (failed("language")) return;
+                languageResult = env->CallIntMethod(tts, setLanguage, locale);
+                if (failed("language")) return;
+                if (languageResult >= 0) currentLanguage = language;
+            }
+            if (currentLanguage == language) {
+                const jint result = env->CallIntMethod(tts, speak, env->NewStringUTF(text.c_str()), 0,
+                                                       static_cast<jobject>(nullptr), env->NewStringUTF("jarvis"));
+                if (failed("speak")) return;
+                if (result == 0) {
+                    setError({});
+                    return;
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(700));   // engine still starting up
+        }
+        setError(currentLanguage == language ? "VOICE: text-to-speech engine not ready"
+                                             : "VOICE: language not available (" + language + ")");
+    };
+
+    for (;;) {
+        std::string text, language;
+        {
+            std::unique_lock<std::mutex> lock(v.mutex);
+            v.wake.wait(lock, [&] { return v.stop || v.hasText; });
+            if (v.stop) break;
+            text = std::move(v.text);
+            language = std::move(v.language);
+            v.hasText = false;
+        }
+        env->PushLocalFrame(32);
+        speakOnce(text, language);
+        env->PopLocalFrame(nullptr);
+    }
+
+    if (tts) {
+        if (jclass ttsClass = env->GetObjectClass(tts)) {
+            if (jmethodID shutdown = env->GetMethodID(ttsClass, "shutdown", "()V")) env->CallVoidMethod(tts, shutdown);
+        }
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        env->DeleteGlobalRef(tts);
+    }
+    if (attached) vm->DetachCurrentThread();
+}
+
+inline void voiceSpeak(const std::string& text, const std::string& language) {
+    if (text.empty()) return;
+    auto& v = voiceService();
+    {
+        std::lock_guard<std::mutex> lock(v.mutex);
+        v.text = text;
+        v.language = language.empty() ? std::string("en-US") : language;
+        v.hasText = true;
+        v.stop = false;
+        if (!v.worker.joinable()) v.worker = std::thread(voiceLoop);
+    }
+    v.wake.notify_one();
+}
+
+inline void voiceShutdown() {
+    auto& v = voiceService();
+    {
+        std::lock_guard<std::mutex> lock(v.mutex);
+        v.stop = true;
+    }
+    v.wake.notify_all();
+    if (v.worker.joinable()) v.worker.join();
+}
+
 struct AiJob {
     std::string provider;   // groq (free tier), grok (xAI, paid) or claude (Anthropic, paid)
     std::string apiKey;
     std::string model;
     std::string language;
     std::string question;   // empty: threat scan
+    bool speak = false;
+    std::string voiceLanguage;
+    bool proactive = false; // started by Jarvis itself (question holds the event description)
 };
 
 struct AiService {
@@ -1631,6 +2112,7 @@ struct AiService {
     std::atomic<bool> busy{false};
     std::string answer;                 // guarded by mutex
     std::string error;                  // guarded by mutex
+    bool answerAuto = false;            // guarded by mutex: the answer was Jarvis' own initiative
     std::chrono::steady_clock::time_point answerAt{};
     std::chrono::steady_clock::time_point lastRequest{};
 };
@@ -1654,7 +2136,7 @@ inline ProviderInfo providerInfo(std::string name) {
     if (name == "grok" || name == "xai") {
         return {"https://api.x.ai/v1/chat/completions", "grok-4.20-0309-non-reasoning", false};
     }
-    return {"https://api.groq.com/openai/v1/chat/completions", "llama-3.1-8b-instant", false};   // default: Groq
+    return {"https://api.groq.com/openai/v1/chat/completions", "openai/gpt-oss-20b", false};   // default: Groq
 }
 
 struct AiRequest {
@@ -1673,7 +2155,10 @@ inline AiRequest buildAiRequest(const AiJob& job, const Snapshot& snap) {
         "Answer in at most 55 words and at most 4 short lines, as plain ASCII text without markdown or emoji. "
         "Reply in " + language + ".";
     std::string user;
-    if (job.question.empty()) {
+    if (job.proactive) {
+        user = "AUTOMATIC ALERT (the player did not ask anything): " + job.question +
+               "\nGive a proactive heads-up in at most 35 words: what it is, how dangerous it is, and one concrete tip.\n\n";
+    } else if (job.question.empty()) {
         user = "Give a short threat assessment of the surroundings and one recommended action.\n\n";
     } else {
         user = "Player question: " + job.question + "\n\n";
@@ -1758,10 +2243,15 @@ inline void aiRunJob(const AiJob& job) {
 
     std::string text, error;
     const bool ok = parseAiResponse(job.provider, response, text, error);
-    std::lock_guard<std::mutex> lock(a.mutex);
-    a.answer = ok ? text : std::string();
-    a.error = ok ? std::string() : error;
-    a.answerAt = std::chrono::steady_clock::now();
+    if (!ok && job.proactive) return;   // an automatic alert that fails stays silent (no red error)
+    {
+        std::lock_guard<std::mutex> lock(a.mutex);
+        a.answer = ok ? text : std::string();
+        a.error = ok ? std::string() : error;
+        a.answerAuto = job.proactive;
+        a.answerAt = std::chrono::steady_clock::now();
+    }
+    if (ok && job.speak) voiceSpeak(text, job.voiceLanguage);
 }
 
 inline void aiWorkerLoop() {
@@ -1875,6 +2365,17 @@ public:
     std::string language = "English";
     float showSeconds = 45.f;
     float panelWidth = 340.f;
+    bool autoReport = true;          // announce the mob under the crosshair and new hostiles nearby
+    bool voice = true;               // read reports and AI answers aloud
+    std::string voiceLang = "en-US"; // BCP-47 tag: en-US, id-ID ...
+    float warnRadius = 24.f;         // hostiles inside this distance trigger a warning
+    bool autoInsight = true;         // Jarvis asks the AI by itself when something important happens
+    float insightCooldown = 30.f;    // minimum seconds between automatic AI insights
+    std::string quickQuestion = "What am I looking at, and what should I do?";   // sent by the Ask Jarvis button
+
+    bool wantsGameData() const { return enabled && (autoReport || autoInsight); }
+
+    void onEnabledChanged() override { core().settings.aiNeeds = wantsGameData(); }
 
     std::vector<ConfigEntry> entries() const override {
         auto list = Panel::entries();
@@ -1884,6 +2385,13 @@ public:
         list.push_back({"question", "Ask Jarvis (type a question)", pl::modmenu::ConfigType::Text, "", "", ""});
         list.push_back({"model", "Model (empty = default)", pl::modmenu::ConfigType::Text, model, "", ""});
         list.push_back({"language", "Reply Language", pl::modmenu::ConfigType::Text, language, "", ""});
+        list.push_back({"quickQuestion", "Ask Jarvis Button Question", pl::modmenu::ConfigType::Text, quickQuestion, "", ""});
+        list.push_back(toggleEntry("autoReport", "Auto Report Mobs", autoReport));
+        list.push_back(toggleEntry("autoInsight", "Auto AI Insights (proactive)", autoInsight));
+        list.push_back(floatEntry("insightCooldown", "Insight Cooldown (seconds)", insightCooldown, 10.f, 180.f));
+        list.push_back(toggleEntry("voice", "Voice (speak aloud)", voice));
+        list.push_back({"voiceLang", "Voice Language (en-US / id-ID)", pl::modmenu::ConfigType::Text, voiceLang, "", ""});
+        list.push_back(floatEntry("warnRadius", "Warning Radius", warnRadius, 8.f, 80.f));
         list.push_back(floatEntry("showSeconds", "Show Answer (seconds)", showSeconds, 5.f, 300.f));
         list.push_back(floatEntry("panelWidth", "Panel Width", panelWidth, 200.f, 700.f));
         return list;
@@ -1897,6 +2405,25 @@ public:
         if (key == "language") { language = trimCopy(value); return true; }
         if (key == "showSeconds") return parseFloat(value, showSeconds);
         if (key == "panelWidth") return parseFloat(value, panelWidth);
+        if (key == "autoReport") {
+            const bool ok = parseBool(value, autoReport);
+            core().settings.aiNeeds = wantsGameData();
+            return ok;
+        }
+        if (key == "autoInsight") {
+            const bool ok = parseBool(value, autoInsight);
+            core().settings.aiNeeds = wantsGameData();
+            return ok;
+        }
+        if (key == "insightCooldown") return parseFloat(value, insightCooldown);
+        if (key == "quickQuestion") {
+            quickQuestion = trimCopy(value);
+            if (quickQuestion.empty()) quickQuestion = "What am I looking at, and what should I do?";
+            return true;
+        }
+        if (key == "voice") return parseBool(value, voice);
+        if (key == "voiceLang") { voiceLang = trimCopy(value); if (voiceLang.empty()) voiceLang = "en-US"; return true; }
+        if (key == "warnRadius") return parseFloat(value, warnRadius);
         if (key == "question") {
             pending = trimCopy(value);
             pendingAt = std::chrono::steady_clock::now();
@@ -1918,6 +2445,13 @@ public:
         j["language"] = language;
         j["showSeconds"] = showSeconds;
         j["panelWidth"] = panelWidth;
+        j["autoReport"] = autoReport;
+        j["voice"] = voice;
+        j["voiceLang"] = voiceLang;
+        j["warnRadius"] = warnRadius;
+        j["autoInsight"] = autoInsight;
+        j["insightCooldown"] = insightCooldown;
+        j["quickQuestion"] = quickQuestion;
     }
 
     void fromJson(const nlohmann::json& j) override {
@@ -1928,9 +2462,22 @@ public:
         if (j.contains("language") && j["language"].is_string()) language = j["language"].get<std::string>();
         if (j.contains("showSeconds")) showSeconds = j["showSeconds"].get<float>();
         if (j.contains("panelWidth")) panelWidth = j["panelWidth"].get<float>();
+        if (j.contains("autoReport")) autoReport = j["autoReport"].get<bool>();
+        if (j.contains("voice")) voice = j["voice"].get<bool>();
+        if (j.contains("voiceLang") && j["voiceLang"].is_string()) voiceLang = j["voiceLang"].get<std::string>();
+        if (j.contains("warnRadius")) warnRadius = j["warnRadius"].get<float>();
+        if (j.contains("autoInsight")) autoInsight = j["autoInsight"].get<bool>();
+        if (j.contains("insightCooldown")) insightCooldown = j["insightCooldown"].get<float>();
+        if (j.contains("quickQuestion") && j["quickQuestion"].is_string() && !j["quickQuestion"].get<std::string>().empty()) {
+            quickQuestion = j["quickQuestion"].get<std::string>();
+        }
+        core().settings.aiNeeds = wantsGameData();
     }
 
     void scan() { submit({}); }
+
+    // The on-screen "Ask Jarvis" button: one tap, no typing.
+    void ask() { submit(quickQuestion); }
 
     void submit(const std::string& question) {
         AiJob job;
@@ -1939,11 +2486,13 @@ public:
         job.model = model;
         job.language = language;
         job.question = question;
+        job.speak = voice;
+        job.voiceLanguage = voiceLang;
         std::string reason;
         aiRequest(job, reason);
     }
 
-    void draw(const Snapshot&) override {
+    void draw(const Snapshot& s) override {
         const auto now = std::chrono::steady_clock::now();
 
         // A typed question is sent once the text has stopped changing for a moment.
@@ -1952,21 +2501,26 @@ public:
             pending.clear();
             submit(question);
         }
+        if (autoReport || autoInsight) autoReports(s, now);
 
         auto& a = ai();
         const bool busy = a.busy.load();
         std::string answer, error;
+        bool answerAuto = false;
         std::chrono::steady_clock::time_point answerAt;
         {
             std::lock_guard<std::mutex> lock(a.mutex);
             answer = a.answer;
             error = a.error;
+            answerAuto = a.answerAuto;
             answerAt = a.answerAt;
         }
 
-        const bool fresh = answerAt.time_since_epoch().count() != 0 &&
-                           std::chrono::duration<float>(now - answerAt).count() < showSeconds;
-        if (!busy && !fresh) {
+        const bool aiFresh = answerAt.time_since_epoch().count() != 0 &&
+                             std::chrono::duration<float>(now - answerAt).count() < showSeconds;
+        const bool reportFresh = reportAt.time_since_epoch().count() != 0 &&
+                                 std::chrono::duration<float>(now - reportAt).count() < 8.f;
+        if (!busy && !aiFresh && !reportFresh) {
             clear();
             return;
         }
@@ -1987,15 +2541,26 @@ public:
             titleColor = kAmber;
             lines = answer.empty() ? std::vector<std::string>{} : wrapText(answer, size, width - pad * 2.f, 12);
             bodyColor = kCyanDim;
+        } else if (reportFresh && (!aiFresh || reportAt > answerAt)) {
+            title = "J.A.R.V.I.S. REPORT";
+            titleColor = reportHostile ? kRed : kGreen;
+            lines = wrapText(reportText, size, width - pad * 2.f, 8);
+            bodyColor = reportHostile ? kRed : kCyan;
         } else if (!error.empty()) {
             titleColor = kRed;
             lines = wrapText(error, size, width - pad * 2.f, 8);
             bodyColor = kRed;
         } else {
+            if (answerAuto) {
+                title = "J.A.R.V.I.S. INSIGHT";
+                titleColor = kAmber;
+            }
             lines = wrapText(answer, size, width - pad * 2.f, 12);
         }
 
-        const float height = pad * 2.f + row * (static_cast<float>(lines.size()) + 1.f);
+        const std::string voiceProblem = voice ? voiceError() : std::string();
+        const std::size_t problemLines = voiceProblem.empty() ? 0 : 1;
+        const float height = pad * 2.f + row * (static_cast<float>(lines.size() + problemLines) + 1.f);
         Canvas canvas;
         canvas.panel(hudX, hudY, width, height, sc, opacity);
         float y = hudY + pad;
@@ -2005,10 +2570,273 @@ public:
             canvas.text(hudX + pad, y, size, argb(1.f, bodyColor), line);
             y += row;
         }
+        if (!voiceProblem.empty()) {
+            canvas.text(hudX + pad, y, size * 0.85f, argb(1.f, kAmber), wrapText(voiceProblem, size * 0.85f, width - pad * 2.f, 1).front());
+        }
         canvas.submit(id);
     }
 
 private:
+    using Clock = std::chrono::steady_clock;
+
+    static std::string lowerName(const std::string& type) {
+        std::string out = type;
+        for (auto& ch : out) ch = ch == '_' ? ' ' : static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        return out;
+    }
+
+    static std::string capitalised(std::string text) {
+        if (!text.empty()) text[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(text[0])));
+        return text;
+    }
+
+    bool indonesian() const { return voiceLang.rfind("id", 0) == 0; }
+
+    static std::string direction(const char* english, bool indo) {
+        if (!indo) return english;
+        static const std::pair<const char*, const char*> map[] = {
+            {"ahead-right", "depan kanan"}, {"ahead-left", "depan kiri"}, {"behind-right", "belakang kanan"},
+            {"behind-left", "belakang kiri"}, {"ahead", "depan"}, {"behind", "belakang"}, {"right", "kanan"}, {"left", "kiri"}};
+        for (const auto& entry : map) {
+            if (std::string_view(english) == entry.first) return entry.second;
+        }
+        return english;
+    }
+
+    void announce(const std::string& text, bool hostile) {
+        reportText = text;
+        reportHostile = hostile;
+        reportAt = Clock::now();
+        if (voice) voiceSpeak(text, voiceLang);
+    }
+
+    struct Tip { std::string_view type; const char* en; const char* id; };
+
+    // Short local advice, used when no AI insight will follow (no key, or insights switched off).
+    static const char* tipFor(const std::string& type, bool indo) {
+        static const Tip tips[] = {
+            {"zombie", "Slow melee. Back away while hitting it.", "Serangan dekat, lambat. Mundur sambil memukul."},
+            {"husk", "Causes hunger. Eat after the fight.", "Bikin lapar. Makan setelah bertarung."},
+            {"drowned", "May carry a trident. Fight it on land.", "Bisa bawa trident. Lawan di darat."},
+            {"skeleton", "Shoots arrows. Close in fast or hide.", "Menembak panah. Dekati cepat atau berlindung."},
+            {"stray", "Slows you with arrows. Close in fast.", "Panahnya memperlambat. Dekati cepat."},
+            {"creeper", "Explodes up close. Keep your distance.", "Meledak jika dekat. Jaga jarak."},
+            {"spider", "Fast and climbs walls. Fight in the open.", "Cepat dan bisa memanjat. Lawan di tempat terbuka."},
+            {"cave_spider", "Poisonous bite. Keep moving.", "Gigitan beracun. Terus bergerak."},
+            {"enderman", "Never look at its head. Avoid it.", "Jangan menatap kepalanya. Hindari."},
+            {"witch", "Throws potions. Close in or use a bow.", "Melempar ramuan. Dekati atau pakai busur."},
+            {"slime", "Splits when hit. Kill the small ones last.", "Terpecah saat dipukul. Habisi yang kecil terakhir."},
+            {"magma_cube", "Splits and burns. Watch your footing.", "Terpecah dan panas. Hati-hati melangkah."},
+            {"phantom", "Appears when you skip sleep. Use a bed.", "Muncul jika kurang tidur. Tidurlah di kasur."},
+            {"pillager", "Crossbow raider. Take cover.", "Pemanah crossbow. Berlindung."},
+            {"vindicator", "Axe raider, hits hard. Keep distance.", "Pembawa kapak, sakit. Jaga jarak."},
+            {"blaze", "Fireballs. Use water or snowballs.", "Menembak api. Pakai air atau bola salju."},
+            {"ghast", "Fireballs can be deflected by hitting them.", "Bola api bisa dipantulkan dengan memukulnya."},
+            {"warden", "Do not fight it. Sneak away.", "Jangan dilawan. Menyelinap pergi."},
+            {"guardian", "Laser from the water. Break line of sight.", "Laser dari air. Hindari garis pandang."},
+            {"silverfish", "Hides in stone. Kill it quickly.", "Bersembunyi di batu. Bunuh cepat."},
+            {"vex", "Flies through walls. Kill it fast.", "Terbang menembus dinding. Bunuh cepat."},
+        };
+        for (const auto& tip : tips) {
+            if (tip.type == type) return indo ? tip.id : tip.en;
+        }
+        return nullptr;
+    }
+
+    bool insightEnabled() const { return autoInsight && !apiKey.empty(); }
+
+    // Remember what happened; flushInsight() sends it to the AI when the cooldown allows.
+    void queueInsight(const std::string& hint, bool urgent, Clock::time_point now) {
+        if (!insightEnabled()) return;
+        if (!pendingHint.empty() && pendingUrgent && !urgent && now - insightAt < std::chrono::seconds(15)) return;
+        pendingHint = hint;
+        pendingUrgent = urgent;
+        insightAt = now;
+    }
+
+    void flushInsight(Clock::time_point now) {
+        if (pendingHint.empty()) return;
+        if (!insightEnabled() || now - insightAt > std::chrono::seconds(15)) {
+            pendingHint.clear();   // stale: the situation has probably changed
+            return;
+        }
+        if (insightCount >= kMaxInsights) return;
+        const float gap = pendingUrgent ? std::min(insightCooldown, 10.f) : insightCooldown;
+        if (lastInsightAt.time_since_epoch().count() != 0 &&
+            std::chrono::duration<float>(now - lastInsightAt).count() < gap) {
+            return;
+        }
+        if (ai().busy.load()) return;
+
+        AiJob job;
+        job.provider = provider;
+        job.apiKey = apiKey;
+        job.model = model;
+        job.language = language;
+        job.question = pendingHint;
+        job.speak = voice;
+        job.voiceLanguage = voiceLang;
+        job.proactive = true;
+        std::string reason;
+        if (aiRequest(job, reason)) {
+            lastInsightAt = now;
+            ++insightCount;
+            pendingHint.clear();
+        }
+    }
+
+    static bool notableBlock(const std::string& name) {
+        std::string lower;
+        for (char ch : name) lower.push_back(ch == '_' ? ' ' : static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
+        static const char* words[] = {" ore", "ancient debris", "spawner", "chest", "lava", "tnt", "magma", "cobweb",
+                                      "sculk", "vault", "trial", "obsidian", "portal", "beacon", "enchanting", "anvil"};
+        if (lower.size() >= 3 && lower.compare(0, 3, "ore") == 0) return true;
+        for (const char* word : words) {
+            if (lower.find(word) != std::string::npos) return true;
+        }
+        return false;
+    }
+
+    void autoReports(const Snapshot& s, Clock::time_point now) {
+        if (!s.valid) return;
+        const bool indo = indonesian();
+        const bool tipsLocally = !insightEnabled();   // the AI adds its own tip when insights are on
+
+        // 1) The mob under the crosshair.
+        if (s.target.kind == Target::Kind::Entity && s.target.hasBox) {
+            lastEntityTarget = now;
+            const std::string key = s.target.type.empty() ? (s.target.player ? "player" : "mob") : s.target.type;
+            if (key != targetKey) {
+                targetKey = key;
+                targetSince = now;
+                targetReported = false;
+            }
+            if (!targetReported && now - targetSince > std::chrono::milliseconds(450) &&
+                now - lastTargetReport > std::chrono::milliseconds(1500)) {
+                targetReported = true;
+                lastTargetReport = now;
+                std::string name = s.target.type.empty()
+                    ? (s.target.player ? std::string("Player") : (indo ? std::string("Makhluk") : std::string("Mob")))
+                    : capitalised(lowerName(s.target.type));
+                if (autoReport) {
+                    char text[160];
+                    if (s.target.hostile) {
+                        std::snprintf(text, sizeof(text), indo ? "%s, musuh, %.0f meter." : "%s, hostile, %.0f meters.",
+                                      name.c_str(), s.target.dist);
+                    } else {
+                        std::snprintf(text, sizeof(text), indo ? "%s, %.0f meter." : "%s, %.0f meters.", name.c_str(), s.target.dist);
+                    }
+                    std::string full = text;
+                    if (tipsLocally && s.target.hostile) {
+                        if (const char* tip = tipFor(s.target.type, indo)) full += std::string(" ") + tip;
+                    }
+                    announce(full, s.target.hostile);
+                }
+                // Only dangerous or unusual targets are worth an AI call; a cow is not.
+                if (s.target.hostile || s.target.player) {
+                    const auto seen = seenAt.find(key);
+                    if (seen == seenAt.end() || now - seen->second > std::chrono::minutes(4)) {
+                        seenAt[key] = now;
+                        char hint[200];
+                        std::snprintf(hint, sizeof(hint), "The player is aiming at %s%s, %.0f meters away.",
+                                      s.target.hostile ? "a hostile " : "a ", name.c_str(), s.target.dist);
+                        queueInsight(hint, s.target.hostile, now);
+                    }
+                }
+            }
+        } else if (now - lastEntityTarget > std::chrono::milliseconds(1200)) {
+            targetKey.clear();
+        }
+
+        // 2) The block under the crosshair, when it is something worth knowing about.
+        if (s.target.kind == Target::Kind::Block && !s.target.name.empty() && notableBlock(s.target.name)) {
+            if (s.target.name != blockKey) {
+                blockKey = s.target.name;
+                blockSince = now;
+                blockQueued = false;
+            }
+            if (!blockQueued && now - blockSince > std::chrono::milliseconds(1500)) {
+                blockQueued = true;
+                const auto seen = seenAt.find("block:" + blockKey);
+                if (seen == seenAt.end() || now - seen->second > std::chrono::minutes(4)) {
+                    seenAt["block:" + blockKey] = now;
+                    char hint[200];
+                    std::snprintf(hint, sizeof(hint), "The player is looking at the block %s, %.0f meters away.",
+                                  s.target.name.c_str(), s.target.dist);
+                    queueInsight(hint, false, now);
+                }
+            }
+        } else if (s.target.kind != Target::Kind::Block) {
+            blockKey.clear();
+        }
+
+        // 3) New hostiles close by.
+        int count = 0;
+        const Contact* nearest = nullptr;
+        std::vector<std::pair<std::string, int>> groups;
+        for (const auto& contact : s.contacts) {
+            if (!contact.hostile || contact.dist > warnRadius) continue;
+            ++count;
+            if (!nearest || contact.dist < nearest->dist) nearest = &contact;
+            const std::string name = contact.type.empty() ? std::string("hostile") : lowerName(contact.type);
+            bool found = false;
+            for (auto& group : groups) {
+                if (group.first == name) { ++group.second; found = true; break; }
+            }
+            if (!found) groups.emplace_back(name, 1);
+        }
+        if (count > lastHostileCount && now - lastThreatReport > std::chrono::seconds(6) && nearest) {
+            lastThreatReport = now;
+            std::string list;
+            for (std::size_t i = 0; i < groups.size() && i < 4; ++i) {
+                if (i) list += ", ";
+                list += std::to_string(groups[i].second) + " " + groups[i].first;
+                if (!indo && groups[i].second > 1 && groups[i].first.back() != 's') list += "s";
+            }
+            const std::string where = direction(relativeName(nearest->dx, nearest->dz, s.yaw), indo);
+            if (autoReport) {
+                char text[220];
+                std::snprintf(text, sizeof(text), indo ? "Peringatan. %s. Terdekat %.0f meter, %s."
+                                                       : "Warning. %s. Nearest %.0f meters, %s.",
+                              list.c_str(), nearest->dist, where.c_str());
+                std::string full = text;
+                if (tipsLocally) {
+                    if (const char* tip = tipFor(nearest->type, indo)) full += std::string(" ") + tip;
+                }
+                announce(full, true);
+            }
+            char hint[260];
+            std::snprintf(hint, sizeof(hint), "Hostile mobs just came within %.0f meters: %s. The nearest is %.0f meters away, %s.",
+                          warnRadius, list.c_str(), nearest->dist, relativeName(nearest->dx, nearest->dz, s.yaw));
+            queueInsight(hint, true, now);
+        }
+        lastHostileCount = count;
+
+        flushInsight(now);
+    }
+
+    std::string reportText;
+    bool reportHostile = false;
+    Clock::time_point reportAt{};
+    std::string targetKey;
+    bool targetReported = false;
+    Clock::time_point targetSince{};
+    Clock::time_point lastEntityTarget{};
+    Clock::time_point lastTargetReport{};
+    Clock::time_point lastThreatReport{};
+    int lastHostileCount = 0;
+
+    static constexpr int kMaxInsights = 200;   // per session; keeps free-tier quotas safe
+    std::string pendingHint;
+    bool pendingUrgent = false;
+    Clock::time_point insightAt{};
+    Clock::time_point lastInsightAt{};
+    int insightCount = 0;
+    std::map<std::string, Clock::time_point> seenAt;
+    std::string blockKey;
+    Clock::time_point blockSince{};
+    bool blockQueued = false;
+
     std::string pending;
     std::chrono::steady_clock::time_point pendingAt{};
     std::chrono::steady_clock::time_point createdAt = std::chrono::steady_clock::now();
@@ -2091,17 +2919,18 @@ inline void registerModules() {
             std::fprintf(stderr, "[Jarvis] Mod Menu rejected module %s\n", panel->id.c_str());
         }
         if (panel->id == "jarvis.ai") {
-            // On-screen button: one tap asks Jarvis for a threat assessment.
-            const bool buttonRegistered = pl::modmenu::ButtonBuilder("jarvis.ai.scan", "Jarvis AI Scan")
+            // On-screen button: one tap asks Jarvis about whatever you are looking at (no typing).
+            const bool buttonRegistered = pl::modmenu::ButtonBuilder("jarvis.ai.scan", "Ask Jarvis")
                 .moduleId(panel->id)
-                .label("AI")
+                .label("Ask Jarvis")
                 .behavior(pl::modmenu::ButtonBehavior::Click)
                 .stylePreset(pl::modmenu::ButtonStylePreset::Accent)
+                .sizeScale(2.2f, 1.0f)
                 .onEvent([](std::string_view, pl::modmenu::ButtonEvent event, float) {
                     if (event != pl::modmenu::ButtonEvent::Click) return;
                     if (!core().started) return;
                     if (auto* aiPanel = dynamic_cast<AiPanel*>(findPanel("jarvis.ai"))) {
-                        if (aiPanel->enabled) aiPanel->scan();
+                        if (aiPanel->enabled) aiPanel->ask();
                     }
                 })
                 .registerButton();
@@ -2226,6 +3055,8 @@ inline void stop() {
     c.hookTarget = nullptr;
     c.state = 0;
     detail::aiShutdown();
+    detail::voiceShutdown();
+    detail::core().settings.aiNeeds = false;
     for (auto& panel : c.panels) panel->clear();
     detail::saveConfig();
     c.started = false;
