@@ -396,6 +396,7 @@ struct TypeFinder {
     std::vector<bool> knownHit;
     int confirmed = -1;
     int evaluations = 0;
+    int fruitless = 0;        // evaluations in a row that produced no name at all
     std::chrono::steady_clock::time_point lastDiscovery{};
     std::string debug;
 };
@@ -492,6 +493,28 @@ inline std::string entityTypeId(const void* actor) {
         return {};
     }
 
+    // Known-good location for this game version (found earlier on a real device: the id string sits
+    // directly inside the actor at +0x200). One matching mob name is enough to trust it, so names
+    // work at once, even when only one kind of mob is around. Other versions fall back to discovery.
+    {
+        const TypePath preset{-1, 0x200};
+        if (evalTypePath(actor, preset, value)) {
+            const std::string name = stripNamespace(value);
+            if (inList(kKnownMobs, name)) {
+                finder.candidates.clear();
+                finder.seen.clear();
+                finder.knownHit.clear();
+                finder.candidates.push_back(preset);
+                finder.seen.emplace_back();
+                finder.seen.back().insert(name);
+                finder.knownHit.push_back(true);
+                finder.confirmed = 0;
+                finder.debug = "ID: direct +0x200 (preset)";
+                return name;
+            }
+        }
+    }
+
     if (finder.candidates.empty()) {
         const auto now = std::chrono::steady_clock::now();
         if (now - finder.lastDiscovery < std::chrono::seconds(1)) return {};
@@ -502,6 +525,20 @@ inline std::string entityTypeId(const void* actor) {
 
     ++finder.evaluations;
     std::string best;
+    struct FruitlessGuard {   // rediscover from another mob when nothing has produced a name for a while
+        TypeFinder& finder;
+        const std::string& best;
+        ~FruitlessGuard() {
+            if (!best.empty()) { finder.fruitless = 0; return; }
+            if (++finder.fruitless > 40 && finder.confirmed < 0) {
+                finder.candidates.clear();
+                finder.seen.clear();
+                finder.knownHit.clear();
+                finder.evaluations = 0;
+                finder.fruitless = 0;
+            }
+        }
+    } guard{finder, best};
     for (std::size_t i = 0; i < finder.candidates.size(); ++i) {
         if (!evalTypePath(actor, finder.candidates[i], value)) continue;
         const std::string name = stripNamespace(value);
@@ -515,7 +552,7 @@ inline std::string entityTypeId(const void* actor) {
         }
     }
     // Only one kind of mob around for a long time: settle on the first location that gave a real name.
-    if (finder.confirmed < 0 && finder.evaluations > 80) {
+    if (finder.confirmed < 0 && finder.evaluations > 30) {
         for (std::size_t i = 0; i < finder.candidates.size(); ++i) {
             if (finder.knownHit[i]) { finder.confirmed = static_cast<int>(i); break; }
         }
