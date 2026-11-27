@@ -62,6 +62,8 @@ struct Contact {
     bool player = false;
     bool hostile = false;
     std::string type;                     // "cow", "zombie" ... (empty when unknown)
+    float wx = 0.f, wy = 0.f, wz = 0.f;   // world position of the mob's feet (for the glow boxes)
+    float width = 0.6f, height = 1.8f;    // approximate hitbox size
 };
 
 struct Target {
@@ -107,6 +109,9 @@ struct Settings {
     std::atomic<float> entityHeight{1.8f};   // assumed mob height for the AR box
     std::atomic<bool> debug{false};          // show calibration info (radar "Debug Categories")
     std::atomic<bool> aiNeeds{false};        // the AI panel wants radar + target data
+    std::atomic<bool> needGlow{false};       // the Spectral Glow module wants every mob around
+    std::atomic<float> glowRange{40.f};
+    std::atomic<float> arFov{70.f};          // vertical field of view shared by the AR overlays
 };
 
 namespace detail {
@@ -267,6 +272,36 @@ inline constexpr MobSize kMobSizes[] = {
     {"blaze", 0.6f, 1.8f}, {"ghast", 4.0f, 4.0f}, {"phantom", 0.9f, 0.5f}, {"squid", 0.8f, 0.8f},
     {"slime", 0.52f, 0.52f}, {"silverfish", 0.4f, 0.3f}, {"fox", 0.6f, 0.7f}, {"player", 0.6f, 1.8f},
 };
+
+struct MobHealth { std::string_view name; float hp; };
+// Vanilla MAXIMUM health. The current health of a mob cannot be read in this version.
+inline constexpr MobHealth kMobHealth[] = {
+    {"cow", 10}, {"mooshroom", 10}, {"pig", 10}, {"sheep", 8}, {"chicken", 4}, {"zombie", 20}, {"husk", 20},
+    {"drowned", 20}, {"zombie_villager", 20}, {"zombie_villager_v2", 20}, {"zombie_pigman", 20},
+    {"zombified_piglin", 20}, {"skeleton", 20}, {"stray", 20}, {"bogged", 16}, {"wither_skeleton", 20},
+    {"creeper", 20}, {"spider", 16}, {"cave_spider", 12}, {"enderman", 40}, {"endermite", 8},
+    {"villager", 20}, {"villager_v2", 20}, {"witch", 26}, {"horse", 30}, {"donkey", 30}, {"mule", 30},
+    {"llama", 30}, {"wolf", 8}, {"cat", 10}, {"ocelot", 10}, {"rabbit", 3}, {"bat", 6}, {"iron_golem", 100},
+    {"snow_golem", 4}, {"blaze", 20}, {"ghast", 10}, {"phantom", 20}, {"squid", 10}, {"glow_squid", 10},
+    {"silverfish", 8}, {"fox", 10}, {"player", 20}, {"wither", 300}, {"ender_dragon", 200}, {"warden", 500},
+    {"evoker", 24}, {"vindicator", 24}, {"pillager", 24}, {"ravager", 100}, {"shulker", 30}, {"guardian", 30},
+    {"elder_guardian", 80}, {"hoglin", 40}, {"zoglin", 40}, {"piglin", 16}, {"piglin_brute", 50}, {"vex", 14},
+    {"strider", 20}, {"turtle", 30}, {"panda", 20}, {"polar_bear", 30}, {"parrot", 6}, {"dolphin", 10},
+    {"cod", 3}, {"salmon", 3}, {"pufferfish", 3}, {"tropicalfish", 3}, {"bee", 10}, {"goat", 10},
+    {"axolotl", 14}, {"frog", 10}, {"tadpole", 6}, {"allay", 20}, {"camel", 32}, {"sniffer", 14},
+    {"armadillo", 12}, {"breeze", 30}, {"trader_llama", 30}, {"wandering_trader", 20}, {"zombie_horse", 15},
+    {"skeleton_horse", 15},
+};
+
+inline bool mobMaxHealth(std::string_view type, float& hp) {
+    for (const auto& entry : kMobHealth) {
+        if (entry.name == type) {
+            hp = entry.hp;
+            return true;
+        }
+    }
+    return false;
+}
 
 template <std::size_t N>
 inline bool inList(const std::string_view (&list)[N], std::string_view value) {
@@ -506,7 +541,9 @@ inline void scanContacts(jsdk::Player* player, const jsdk::Vec3& me, Snapshot& o
     out.nearestHostile = -1.f;
     if (!c.fetchNearby) return;
 
-    const float range = std::clamp(c.settings.radarRange.load(), 8.f, 180.f);
+    const bool glow = c.settings.needGlow.load();
+    float range = std::clamp(c.settings.radarRange.load(), 8.f, 180.f);
+    if (glow) range = std::max(range, std::clamp(c.settings.glowRange.load(), 8.f, 180.f));
     const unsigned mask = static_cast<unsigned>(c.settings.hostileMask.load());
     const bool showPlayers = c.settings.showPlayers.load();
     const bool showPassive = c.settings.showPassive.load();
@@ -537,8 +574,18 @@ inline void scanContacts(jsdk::Player* player, const jsdk::Vec3& me, Snapshot& o
             contact.hostile = !contact.player &&
                               (contact.type.empty() ? (contact.cats & mask) != 0 : isHostileType(contact.type));
 
-            if (contact.player && !showPlayers) continue;
-            if (!contact.player && !contact.hostile && !showPassive) continue;
+            // The radar applies these two filters itself when drawing; the glow wants everything.
+            if (!glow) {
+                if (contact.player && !showPlayers) continue;
+                if (!contact.player && !contact.hostile && !showPassive) continue;
+            }
+
+            contact.wx = pos.x;
+            contact.wz = pos.z;
+            contact.wy = contact.player ? pos.y - 1.62f : pos.y;   // mobs are stored at their feet
+            contact.height = std::clamp(c.settings.entityHeight.load(), 0.3f, 6.f);
+            if (contact.player) mobSize("player", contact.width, contact.height);
+            else if (!contact.type.empty()) mobSize(contact.type, contact.width, contact.height);
 
             if (contact.hostile) {
                 ++out.hostileCount;
@@ -695,7 +742,9 @@ inline void onTick(jsdk::Player* player) {
 
     Snapshot scratch;
     const bool aiWants = c.settings.aiNeeds.load();
-    const bool doRadar = (c.settings.needRadar.load() || aiWants) && due(c.lastRadar, kScanIntervalMs);
+    const bool glowWants = c.settings.needGlow.load();
+    const bool doRadar = (c.settings.needRadar.load() || aiWants || glowWants) &&
+                         due(c.lastRadar, glowWants ? 50 : kScanIntervalMs);
     const bool doTarget = (c.settings.needScanner.load() || aiWants) && due(c.lastTarget, kTargetIntervalMs);
     if (doRadar) scanContacts(player, pos, scratch);
     if (doTarget) {
@@ -1217,6 +1266,8 @@ public:
 
         const float pulse = 0.65f + 0.35f * std::sin(nowSeconds() * 6.f);
         for (const auto& c : s.contacts) {
+            if (c.player && !showPlayers) continue;
+            if (!c.player && !c.hostile && !showPassive) continue;
             const float right = c.dx * -cosY + c.dz * -sinY;
             const float ahead = c.dx * -sinY + c.dz * cosY;
             if (right * right + ahead * ahead > range * range) continue;
@@ -1371,7 +1422,10 @@ public:
     float fov = 70.f;           // vertical field of view used by the AR projection
     float entityHeight = 1.8f;  // assumed mob height for the AR box
 
-    void pushSettings() { core().settings.entityHeight = entityHeight; }
+    void pushSettings() {
+        core().settings.entityHeight = entityHeight;
+        core().settings.arFov = fov;
+    }
 
     void onEnabledChanged() override {
         core().settings.needScanner = enabled;
@@ -1393,7 +1447,11 @@ public:
         if (key == "showTarget") return parseBool(value, showTarget);
         if (key == "showHeldItem") return parseBool(value, showHeldItem);
         if (key == "arOverlay") return parseBool(value, arOverlay);
-        if (key == "fov") return parseFloat(value, fov);
+        if (key == "fov") {
+            const bool ok = parseFloat(value, fov);
+            pushSettings();
+            return ok;
+        }
         if (key == "entityHeight") {
             const bool ok = parseFloat(value, entityHeight);
             pushSettings();
@@ -1444,8 +1502,13 @@ public:
                 const std::uint32_t color = t.player ? kWhite : (t.hostile ? kRed : kGreen);
                 lines.push_back({"ENTITY", cls, color});
                 lines.push_back({"RANGE", formatFloat("%.1f m", t.dist), kCyan});
-                // Health is not exposed yet (needs an offset for this game version).
-                lines.push_back({"HEALTH", "N/A", kCyanDim});
+                // Current health is not readable in this game version; show the vanilla maximum.
+                float maxHp = 0.f;
+                if (!t.player && !t.type.empty() ? mobMaxHealth(t.type, maxHp) : (t.player && mobMaxHealth("player", maxHp))) {
+                    lines.push_back({"MAX HP", formatFloat("%.0f", maxHp), kGreen});
+                } else {
+                    lines.push_back({"HEALTH", "N/A", kCyanDim});
+                }
             }
         }
         if (showHeldItem) {
@@ -1574,13 +1637,175 @@ private:
             if (!t.type.empty() && t.hostile) topLeft.push_back({"HOSTILE", kRed});
             if (core().settings.debug.load()) topLeft.push_back({typeFinder().debug.empty() ? std::string("ID: searching") : typeFinder().debug, kCyanDim});
             topLeft.push_back({formatFloat("RANGE %.1f m", t.dist), kCyan});
-            topRight.push_back({"HEALTH N/A", kCyanDim});
+            float maxHp = 0.f;
+            if (t.player ? mobMaxHealth("player", maxHp) : (!t.type.empty() && mobMaxHealth(t.type, maxHp))) {
+                topRight.push_back({formatFloat("MAX HP %.0f", maxHp), kGreen});
+                topRight.push_back({formatFloat("%.0f HEARTS", maxHp * 0.5f), kCyanDim});
+            } else {
+                topRight.push_back({"HEALTH N/A", kCyanDim});
+            }
             if (t.hostile) bottomRight.push_back({"THREAT: ENGAGE?", kRed});
         }
 
         callout(left, top, -70.f * sc, -55.f * sc, -1, topLeft);
         callout(right, top, 70.f * sc, -55.f * sc, 1, topRight);
         callout(right, bottom, 55.f * sc, 50.f * sc, 1, bottomRight);
+    }
+};
+
+
+// ===========================================================================
+// Spectral Glow: every mob around you glows through walls (like a Spectral Arrow)
+// ===========================================================================
+
+class GlowPanel : public Panel {
+public:
+    GlowPanel()
+        : Panel("jarvis.glow", "Jarvis Spectral Glow",
+                "Outlines mobs with a glowing box that stays visible through walls: red = hostile, green = passive.",
+                0.f, 0.f) {}
+
+    float range = 40.f;
+    bool hostileOnly = false;
+    bool showPlayers = true;
+    bool labels = true;
+    float strength = 1.f;
+    int maxMobs = 20;
+
+    void pushSettings() {
+        core().settings.needGlow = enabled;
+        core().settings.glowRange = range;
+    }
+
+    void onEnabledChanged() override { pushSettings(); }
+
+    std::vector<ConfigEntry> entries() const override {
+        auto list = Panel::entries();
+        list.push_back(floatEntry("range", "Glow Range (blocks)", range, 10.f, 120.f));
+        list.push_back(toggleEntry("hostileOnly", "Hostile Mobs Only", hostileOnly));
+        list.push_back(toggleEntry("showPlayers", "Glow Players", showPlayers));
+        list.push_back(toggleEntry("labels", "Show Name + Health Labels", labels));
+        list.push_back(floatEntry("strength", "Glow Strength", strength, 0.3f, 2.f));
+        list.push_back(intEntry("maxMobs", "Max Glowing Mobs", maxMobs, 4, 40));
+        return list;
+    }
+
+    bool set(const std::string& key, std::string_view value) override {
+        if (Panel::set(key, value)) return true;
+        if (key == "range") {
+            const bool ok = parseFloat(value, range);
+            pushSettings();
+            return ok;
+        }
+        if (key == "hostileOnly") return parseBool(value, hostileOnly);
+        if (key == "showPlayers") return parseBool(value, showPlayers);
+        if (key == "labels") return parseBool(value, labels);
+        if (key == "strength") return parseFloat(value, strength);
+        if (key == "maxMobs") return parseInt(value, maxMobs);
+        return false;
+    }
+
+    void toJson(nlohmann::json& j) const override {
+        Panel::toJson(j);
+        j["range"] = range;
+        j["hostileOnly"] = hostileOnly;
+        j["showPlayers"] = showPlayers;
+        j["labels"] = labels;
+        j["strength"] = strength;
+        j["maxMobs"] = maxMobs;
+    }
+
+    void fromJson(const nlohmann::json& j) override {
+        Panel::fromJson(j);
+        if (j.contains("range")) range = j["range"].get<float>();
+        if (j.contains("hostileOnly")) hostileOnly = j["hostileOnly"].get<bool>();
+        if (j.contains("showPlayers")) showPlayers = j["showPlayers"].get<bool>();
+        if (j.contains("labels")) labels = j["labels"].get<bool>();
+        if (j.contains("strength")) strength = j["strength"].get<float>();
+        if (j.contains("maxMobs")) maxMobs = j["maxMobs"].get<int>();
+        pushSettings();
+    }
+
+    void draw(const Snapshot& s) override {
+        const auto surface = pl::modmenu::getHudSurfaceSize();
+        if (!s.valid || !(surface.width > 100.f) || !(surface.height > 100.f)) {
+            clear();
+            return;
+        }
+        const Camera cam = makeCamera(s, core().settings.arFov.load(), surface.width, surface.height);
+        const float sc = scale;
+        const float glow = std::clamp(strength, 0.3f, 2.f);
+        const float pulse = 0.85f + 0.15f * std::sin(nowSeconds() * 4.f);
+        const float labelSize = 15.f * sc;
+
+        Canvas canvas;
+        int drawn = 0;
+        for (const auto& c : s.contacts) {                 // nearest first
+            if (drawn >= std::clamp(maxMobs, 4, 40)) break;
+            if (c.dist > range) continue;
+            if (hostileOnly && !c.hostile) continue;
+            if (c.player && !showPlayers) continue;
+
+            const float xs[2] = {c.wx - c.width * 0.5f, c.wx + c.width * 0.5f};
+            const float ys[2] = {c.wy, c.wy + c.height};
+            const float zs[2] = {c.wz - c.width * 0.5f, c.wz + c.width * 0.5f};
+
+            struct Seg { float x1, y1, x2, y2; };
+            Seg segs[12];
+            int count = 0;
+            float left = 1e9f, right = -1e9f, top = 1e9f, bottom = -1e9f;
+            auto edge = [&](int ax, int ay, int az, int bx, int by, int bz) {
+                Seg seg;
+                if (!projectSegment(cam, xs[ax], ys[ay], zs[az], xs[bx], ys[by], zs[bz], seg.x1, seg.y1, seg.x2, seg.y2)) return;
+                segs[count++] = seg;
+                left = std::min({left, seg.x1, seg.x2}); right = std::max({right, seg.x1, seg.x2});
+                top = std::min({top, seg.y1, seg.y2}); bottom = std::max({bottom, seg.y1, seg.y2});
+            };
+            for (int a = 0; a < 2; ++a) {
+                for (int b = 0; b < 2; ++b) {
+                    edge(0, a, b, 1, a, b);
+                    edge(a, 0, b, a, 1, b);
+                    edge(a, b, 0, a, b, 1);
+                }
+            }
+            if (count == 0) continue;
+            // Entirely off screen: skip it.
+            if (right < 0.f || left > surface.width || bottom < 0.f || top > surface.height) continue;
+            ++drawn;
+
+            const std::uint32_t color = c.hostile ? kRed : (c.player ? kWhite : kGreen);
+            const float fade = std::clamp(1.2f - c.dist / std::max(range, 1.f) * 0.5f, 0.45f, 1.f);
+
+            // Soft body fill (skipped when the mob is right in your face).
+            if (c.dist > 2.5f && right - left < surface.width * 0.8f && bottom - top < surface.height * 0.9f) {
+                canvas.rect(left, top, right - left, bottom - top, argb(0.07f * glow * pulse * fade, color));
+            }
+            for (int i = 0; i < count; ++i) {                // outer halo, inner halo, bright core
+                canvas.line(segs[i].x1, segs[i].y1, segs[i].x2, segs[i].y2, 6.f * sc, argb(0.10f * glow * pulse * fade, color));
+            }
+            for (int i = 0; i < count; ++i) {
+                canvas.line(segs[i].x1, segs[i].y1, segs[i].x2, segs[i].y2, 3.4f * sc, argb(0.24f * glow * pulse * fade, color));
+            }
+            for (int i = 0; i < count; ++i) {
+                canvas.line(segs[i].x1, segs[i].y1, segs[i].x2, segs[i].y2, 1.4f * sc, argb(std::min(1.f, 0.95f * fade), color));
+            }
+
+            if (labels && c.dist <= 45.f) {
+                std::string text = c.player ? std::string("PLAYER")
+                                            : (c.type.empty() ? std::string(c.hostile ? "HOSTILE" : "MOB") : prettify(c.type));
+                text += formatFloat("  %.0fm", c.dist);
+                float maxHp = 0.f;
+                if (c.player ? mobMaxHealth("player", maxHp) : (!c.type.empty() && mobMaxHealth(c.type, maxHp))) {
+                    text += formatFloat("  HP %.0f", maxHp);
+                }
+                const float w = textWidth(text, labelSize);
+                const float x = std::clamp((left + right) * 0.5f - w * 0.5f, 4.f, surface.width - w - 4.f);
+                const float y = std::clamp(top - labelSize * 1.5f, 4.f, surface.height - labelSize - 4.f);
+                canvas.rect(x - 3.f * sc, y - 1.f * sc, w + 6.f * sc, labelSize * 1.25f, argb(0.45f * opacity, kPanelColor));
+                canvas.text(x, y, labelSize, argb(1.f, color), text);
+            }
+        }
+        canvas.submit(id);
     }
 };
 
@@ -2924,7 +3149,10 @@ inline void registerModules() {
                 .moduleId(panel->id)
                 .label("Ask Jarvis")
                 .behavior(pl::modmenu::ButtonBehavior::Click)
-                .stylePreset(pl::modmenu::ButtonStylePreset::Accent)
+                .stylePreset(pl::modmenu::ButtonStylePreset::Keycap)   // the blocky Minecraft key look
+                .styleColors(0xFF2E6FE0, 0xFF5CA0FF, 0xFF16398A)       // blue: normal, pressed, border
+                .textColor(0xFFFFFFFF)
+                .activeTextColor(0xFFFFFFFF)
                 .sizeScale(2.2f, 1.0f)
                 .onEvent([](std::string_view, pl::modmenu::ButtonEvent event, float) {
                     if (event != pl::modmenu::ButtonEvent::Click) return;
@@ -3031,6 +3259,7 @@ inline void start(const Id& modId, const Dir& configDir) {
         c.panels.push_back(std::make_shared<detail::StatusPanel>());
         c.panels.push_back(std::make_shared<detail::RadarPanel>());
         c.panels.push_back(std::make_shared<detail::ScannerPanel>());
+        c.panels.push_back(std::make_shared<detail::GlowPanel>());
         c.panels.push_back(std::make_shared<detail::AiPanel>());
     }
     detail::loadConfig();
@@ -3057,6 +3286,7 @@ inline void stop() {
     detail::aiShutdown();
     detail::voiceShutdown();
     detail::core().settings.aiNeeds = false;
+    detail::core().settings.needGlow = false;
     for (auto& panel : c.panels) panel->clear();
     detail::saveConfig();
     c.started = false;
