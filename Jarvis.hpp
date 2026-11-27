@@ -23,6 +23,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <map>
 #include <atomic>
 #include <cctype>
 #include <chrono>
@@ -1890,10 +1891,35 @@ inline std::string buildState(const Snapshot& s) {
 inline std::string cleanAnswer(const std::string& text) {
     std::string out;
     out.reserve(text.size());
-    for (unsigned char ch : text) {
+    for (std::size_t i = 0; i < text.size(); ++i) {
+        const unsigned char ch = static_cast<unsigned char>(text[i]);
         if (ch == '\r' || ch == '*' || ch == '#' || ch == '`') continue;
-        if (ch == '\n' || (ch >= 32 && ch < 127)) out.push_back(static_cast<char>(ch));
-        else if (ch >= 0x80) { if ((ch & 0xC0) != 0x80) out.push_back('?'); }   // one '?' per UTF-8 character
+        if (ch == '\n' || (ch >= 32 && ch < 127)) {
+            out.push_back(static_cast<char>(ch));
+            continue;
+        }
+        if (ch < 0x80) continue;
+        if ((ch & 0xC0) == 0x80) continue;   // stray continuation byte
+
+        // Decode one UTF-8 character and map the common typographic ones to ASCII.
+        std::size_t length = (ch & 0xE0) == 0xC0 ? 2 : ((ch & 0xF0) == 0xE0 ? 3 : 4);
+        std::uint32_t cp = length == 2 ? (ch & 0x1Fu) : (length == 3 ? (ch & 0x0Fu) : (ch & 0x07u));
+        std::size_t used = 1;
+        while (used < length && i + used < text.size() &&
+               (static_cast<unsigned char>(text[i + used]) & 0xC0) == 0x80) {
+            cp = (cp << 6) | (static_cast<unsigned char>(text[i + used]) & 0x3Fu);
+            ++used;
+        }
+        i += used - 1;
+        if (cp == 0xA0 || cp == 0x202F || cp == 0x2009 || cp == 0x200A || cp == 0x2007) out.push_back(' ');
+        else if (cp == 0x200B || cp == 0x200C || cp == 0x200D || cp == 0xFEFF) continue;
+        else if (cp == 0x2013 || cp == 0x2014 || cp == 0x2212) out.push_back('-');
+        else if (cp == 0x2018 || cp == 0x2019) out.push_back('\'');
+        else if (cp == 0x201C || cp == 0x201D) out.push_back('"');
+        else if (cp == 0x2026) out += "...";
+        else if (cp == 0x2192) out += "->";
+        else if (cp == 0x2022) out.push_back('-');
+        else out.push_back('?');
     }
     return out;
 }
@@ -2072,6 +2098,7 @@ struct AiJob {
     std::string question;   // empty: threat scan
     bool speak = false;
     std::string voiceLanguage;
+    bool proactive = false; // started by Jarvis itself (question holds the event description)
 };
 
 struct AiService {
@@ -2085,6 +2112,7 @@ struct AiService {
     std::atomic<bool> busy{false};
     std::string answer;                 // guarded by mutex
     std::string error;                  // guarded by mutex
+    bool answerAuto = false;            // guarded by mutex: the answer was Jarvis' own initiative
     std::chrono::steady_clock::time_point answerAt{};
     std::chrono::steady_clock::time_point lastRequest{};
 };
@@ -2127,7 +2155,10 @@ inline AiRequest buildAiRequest(const AiJob& job, const Snapshot& snap) {
         "Answer in at most 55 words and at most 4 short lines, as plain ASCII text without markdown or emoji. "
         "Reply in " + language + ".";
     std::string user;
-    if (job.question.empty()) {
+    if (job.proactive) {
+        user = "AUTOMATIC ALERT (the player did not ask anything): " + job.question +
+               "\nGive a proactive heads-up in at most 35 words: what it is, how dangerous it is, and one concrete tip.\n\n";
+    } else if (job.question.empty()) {
         user = "Give a short threat assessment of the surroundings and one recommended action.\n\n";
     } else {
         user = "Player question: " + job.question + "\n\n";
@@ -2212,10 +2243,12 @@ inline void aiRunJob(const AiJob& job) {
 
     std::string text, error;
     const bool ok = parseAiResponse(job.provider, response, text, error);
+    if (!ok && job.proactive) return;   // an automatic alert that fails stays silent (no red error)
     {
         std::lock_guard<std::mutex> lock(a.mutex);
         a.answer = ok ? text : std::string();
         a.error = ok ? std::string() : error;
+        a.answerAuto = job.proactive;
         a.answerAt = std::chrono::steady_clock::now();
     }
     if (ok && job.speak) voiceSpeak(text, job.voiceLanguage);
@@ -2336,8 +2369,13 @@ public:
     bool voice = true;               // read reports and AI answers aloud
     std::string voiceLang = "en-US"; // BCP-47 tag: en-US, id-ID ...
     float warnRadius = 24.f;         // hostiles inside this distance trigger a warning
+    bool autoInsight = true;         // Jarvis asks the AI by itself when something important happens
+    float insightCooldown = 30.f;    // minimum seconds between automatic AI insights
+    std::string quickQuestion = "What am I looking at, and what should I do?";   // sent by the Ask Jarvis button
 
-    void onEnabledChanged() override { core().settings.aiNeeds = enabled && autoReport; }
+    bool wantsGameData() const { return enabled && (autoReport || autoInsight); }
+
+    void onEnabledChanged() override { core().settings.aiNeeds = wantsGameData(); }
 
     std::vector<ConfigEntry> entries() const override {
         auto list = Panel::entries();
@@ -2347,7 +2385,10 @@ public:
         list.push_back({"question", "Ask Jarvis (type a question)", pl::modmenu::ConfigType::Text, "", "", ""});
         list.push_back({"model", "Model (empty = default)", pl::modmenu::ConfigType::Text, model, "", ""});
         list.push_back({"language", "Reply Language", pl::modmenu::ConfigType::Text, language, "", ""});
+        list.push_back({"quickQuestion", "Ask Jarvis Button Question", pl::modmenu::ConfigType::Text, quickQuestion, "", ""});
         list.push_back(toggleEntry("autoReport", "Auto Report Mobs", autoReport));
+        list.push_back(toggleEntry("autoInsight", "Auto AI Insights (proactive)", autoInsight));
+        list.push_back(floatEntry("insightCooldown", "Insight Cooldown (seconds)", insightCooldown, 10.f, 180.f));
         list.push_back(toggleEntry("voice", "Voice (speak aloud)", voice));
         list.push_back({"voiceLang", "Voice Language (en-US / id-ID)", pl::modmenu::ConfigType::Text, voiceLang, "", ""});
         list.push_back(floatEntry("warnRadius", "Warning Radius", warnRadius, 8.f, 80.f));
@@ -2366,8 +2407,19 @@ public:
         if (key == "panelWidth") return parseFloat(value, panelWidth);
         if (key == "autoReport") {
             const bool ok = parseBool(value, autoReport);
-            core().settings.aiNeeds = enabled && autoReport;
+            core().settings.aiNeeds = wantsGameData();
             return ok;
+        }
+        if (key == "autoInsight") {
+            const bool ok = parseBool(value, autoInsight);
+            core().settings.aiNeeds = wantsGameData();
+            return ok;
+        }
+        if (key == "insightCooldown") return parseFloat(value, insightCooldown);
+        if (key == "quickQuestion") {
+            quickQuestion = trimCopy(value);
+            if (quickQuestion.empty()) quickQuestion = "What am I looking at, and what should I do?";
+            return true;
         }
         if (key == "voice") return parseBool(value, voice);
         if (key == "voiceLang") { voiceLang = trimCopy(value); if (voiceLang.empty()) voiceLang = "en-US"; return true; }
@@ -2397,6 +2449,9 @@ public:
         j["voice"] = voice;
         j["voiceLang"] = voiceLang;
         j["warnRadius"] = warnRadius;
+        j["autoInsight"] = autoInsight;
+        j["insightCooldown"] = insightCooldown;
+        j["quickQuestion"] = quickQuestion;
     }
 
     void fromJson(const nlohmann::json& j) override {
@@ -2411,10 +2466,18 @@ public:
         if (j.contains("voice")) voice = j["voice"].get<bool>();
         if (j.contains("voiceLang") && j["voiceLang"].is_string()) voiceLang = j["voiceLang"].get<std::string>();
         if (j.contains("warnRadius")) warnRadius = j["warnRadius"].get<float>();
-        core().settings.aiNeeds = enabled && autoReport;
+        if (j.contains("autoInsight")) autoInsight = j["autoInsight"].get<bool>();
+        if (j.contains("insightCooldown")) insightCooldown = j["insightCooldown"].get<float>();
+        if (j.contains("quickQuestion") && j["quickQuestion"].is_string() && !j["quickQuestion"].get<std::string>().empty()) {
+            quickQuestion = j["quickQuestion"].get<std::string>();
+        }
+        core().settings.aiNeeds = wantsGameData();
     }
 
     void scan() { submit({}); }
+
+    // The on-screen "Ask Jarvis" button: one tap, no typing.
+    void ask() { submit(quickQuestion); }
 
     void submit(const std::string& question) {
         AiJob job;
@@ -2438,16 +2501,18 @@ public:
             pending.clear();
             submit(question);
         }
-        if (autoReport) autoReports(s, now);
+        if (autoReport || autoInsight) autoReports(s, now);
 
         auto& a = ai();
         const bool busy = a.busy.load();
         std::string answer, error;
+        bool answerAuto = false;
         std::chrono::steady_clock::time_point answerAt;
         {
             std::lock_guard<std::mutex> lock(a.mutex);
             answer = a.answer;
             error = a.error;
+            answerAuto = a.answerAuto;
             answerAt = a.answerAt;
         }
 
@@ -2479,13 +2544,17 @@ public:
         } else if (reportFresh && (!aiFresh || reportAt > answerAt)) {
             title = "J.A.R.V.I.S. REPORT";
             titleColor = reportHostile ? kRed : kGreen;
-            lines = wrapText(reportText, size, width - pad * 2.f, 6);
+            lines = wrapText(reportText, size, width - pad * 2.f, 8);
             bodyColor = reportHostile ? kRed : kCyan;
         } else if (!error.empty()) {
             titleColor = kRed;
             lines = wrapText(error, size, width - pad * 2.f, 8);
             bodyColor = kRed;
         } else {
+            if (answerAuto) {
+                title = "J.A.R.V.I.S. INSIGHT";
+                titleColor = kAmber;
+            }
             lines = wrapText(answer, size, width - pad * 2.f, 12);
         }
 
@@ -2541,9 +2610,97 @@ private:
         if (voice) voiceSpeak(text, voiceLang);
     }
 
+    struct Tip { std::string_view type; const char* en; const char* id; };
+
+    // Short local advice, used when no AI insight will follow (no key, or insights switched off).
+    static const char* tipFor(const std::string& type, bool indo) {
+        static const Tip tips[] = {
+            {"zombie", "Slow melee. Back away while hitting it.", "Serangan dekat, lambat. Mundur sambil memukul."},
+            {"husk", "Causes hunger. Eat after the fight.", "Bikin lapar. Makan setelah bertarung."},
+            {"drowned", "May carry a trident. Fight it on land.", "Bisa bawa trident. Lawan di darat."},
+            {"skeleton", "Shoots arrows. Close in fast or hide.", "Menembak panah. Dekati cepat atau berlindung."},
+            {"stray", "Slows you with arrows. Close in fast.", "Panahnya memperlambat. Dekati cepat."},
+            {"creeper", "Explodes up close. Keep your distance.", "Meledak jika dekat. Jaga jarak."},
+            {"spider", "Fast and climbs walls. Fight in the open.", "Cepat dan bisa memanjat. Lawan di tempat terbuka."},
+            {"cave_spider", "Poisonous bite. Keep moving.", "Gigitan beracun. Terus bergerak."},
+            {"enderman", "Never look at its head. Avoid it.", "Jangan menatap kepalanya. Hindari."},
+            {"witch", "Throws potions. Close in or use a bow.", "Melempar ramuan. Dekati atau pakai busur."},
+            {"slime", "Splits when hit. Kill the small ones last.", "Terpecah saat dipukul. Habisi yang kecil terakhir."},
+            {"magma_cube", "Splits and burns. Watch your footing.", "Terpecah dan panas. Hati-hati melangkah."},
+            {"phantom", "Appears when you skip sleep. Use a bed.", "Muncul jika kurang tidur. Tidurlah di kasur."},
+            {"pillager", "Crossbow raider. Take cover.", "Pemanah crossbow. Berlindung."},
+            {"vindicator", "Axe raider, hits hard. Keep distance.", "Pembawa kapak, sakit. Jaga jarak."},
+            {"blaze", "Fireballs. Use water or snowballs.", "Menembak api. Pakai air atau bola salju."},
+            {"ghast", "Fireballs can be deflected by hitting them.", "Bola api bisa dipantulkan dengan memukulnya."},
+            {"warden", "Do not fight it. Sneak away.", "Jangan dilawan. Menyelinap pergi."},
+            {"guardian", "Laser from the water. Break line of sight.", "Laser dari air. Hindari garis pandang."},
+            {"silverfish", "Hides in stone. Kill it quickly.", "Bersembunyi di batu. Bunuh cepat."},
+            {"vex", "Flies through walls. Kill it fast.", "Terbang menembus dinding. Bunuh cepat."},
+        };
+        for (const auto& tip : tips) {
+            if (tip.type == type) return indo ? tip.id : tip.en;
+        }
+        return nullptr;
+    }
+
+    bool insightEnabled() const { return autoInsight && !apiKey.empty(); }
+
+    // Remember what happened; flushInsight() sends it to the AI when the cooldown allows.
+    void queueInsight(const std::string& hint, bool urgent, Clock::time_point now) {
+        if (!insightEnabled()) return;
+        if (!pendingHint.empty() && pendingUrgent && !urgent && now - insightAt < std::chrono::seconds(15)) return;
+        pendingHint = hint;
+        pendingUrgent = urgent;
+        insightAt = now;
+    }
+
+    void flushInsight(Clock::time_point now) {
+        if (pendingHint.empty()) return;
+        if (!insightEnabled() || now - insightAt > std::chrono::seconds(15)) {
+            pendingHint.clear();   // stale: the situation has probably changed
+            return;
+        }
+        if (insightCount >= kMaxInsights) return;
+        const float gap = pendingUrgent ? std::min(insightCooldown, 10.f) : insightCooldown;
+        if (lastInsightAt.time_since_epoch().count() != 0 &&
+            std::chrono::duration<float>(now - lastInsightAt).count() < gap) {
+            return;
+        }
+        if (ai().busy.load()) return;
+
+        AiJob job;
+        job.provider = provider;
+        job.apiKey = apiKey;
+        job.model = model;
+        job.language = language;
+        job.question = pendingHint;
+        job.speak = voice;
+        job.voiceLanguage = voiceLang;
+        job.proactive = true;
+        std::string reason;
+        if (aiRequest(job, reason)) {
+            lastInsightAt = now;
+            ++insightCount;
+            pendingHint.clear();
+        }
+    }
+
+    static bool notableBlock(const std::string& name) {
+        std::string lower;
+        for (char ch : name) lower.push_back(ch == '_' ? ' ' : static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
+        static const char* words[] = {" ore", "ancient debris", "spawner", "chest", "lava", "tnt", "magma", "cobweb",
+                                      "sculk", "vault", "trial", "obsidian", "portal", "beacon", "enchanting", "anvil"};
+        if (lower.size() >= 3 && lower.compare(0, 3, "ore") == 0) return true;
+        for (const char* word : words) {
+            if (lower.find(word) != std::string::npos) return true;
+        }
+        return false;
+    }
+
     void autoReports(const Snapshot& s, Clock::time_point now) {
         if (!s.valid) return;
         const bool indo = indonesian();
+        const bool tipsLocally = !insightEnabled();   // the AI adds its own tip when insights are on
 
         // 1) The mob under the crosshair.
         if (s.target.kind == Target::Kind::Entity && s.target.hasBox) {
@@ -2561,20 +2718,59 @@ private:
                 std::string name = s.target.type.empty()
                     ? (s.target.player ? std::string("Player") : (indo ? std::string("Makhluk") : std::string("Mob")))
                     : capitalised(lowerName(s.target.type));
-                char text[160];
-                if (s.target.hostile) {
-                    std::snprintf(text, sizeof(text), indo ? "%s, musuh, %.0f meter." : "%s, hostile, %.0f meters.",
-                                  name.c_str(), s.target.dist);
-                } else {
-                    std::snprintf(text, sizeof(text), indo ? "%s, %.0f meter." : "%s, %.0f meters.", name.c_str(), s.target.dist);
+                if (autoReport) {
+                    char text[160];
+                    if (s.target.hostile) {
+                        std::snprintf(text, sizeof(text), indo ? "%s, musuh, %.0f meter." : "%s, hostile, %.0f meters.",
+                                      name.c_str(), s.target.dist);
+                    } else {
+                        std::snprintf(text, sizeof(text), indo ? "%s, %.0f meter." : "%s, %.0f meters.", name.c_str(), s.target.dist);
+                    }
+                    std::string full = text;
+                    if (tipsLocally && s.target.hostile) {
+                        if (const char* tip = tipFor(s.target.type, indo)) full += std::string(" ") + tip;
+                    }
+                    announce(full, s.target.hostile);
                 }
-                announce(text, s.target.hostile);
+                // Only dangerous or unusual targets are worth an AI call; a cow is not.
+                if (s.target.hostile || s.target.player) {
+                    const auto seen = seenAt.find(key);
+                    if (seen == seenAt.end() || now - seen->second > std::chrono::minutes(4)) {
+                        seenAt[key] = now;
+                        char hint[200];
+                        std::snprintf(hint, sizeof(hint), "The player is aiming at %s%s, %.0f meters away.",
+                                      s.target.hostile ? "a hostile " : "a ", name.c_str(), s.target.dist);
+                        queueInsight(hint, s.target.hostile, now);
+                    }
+                }
             }
         } else if (now - lastEntityTarget > std::chrono::milliseconds(1200)) {
             targetKey.clear();
         }
 
-        // 2) New hostiles close by.
+        // 2) The block under the crosshair, when it is something worth knowing about.
+        if (s.target.kind == Target::Kind::Block && !s.target.name.empty() && notableBlock(s.target.name)) {
+            if (s.target.name != blockKey) {
+                blockKey = s.target.name;
+                blockSince = now;
+                blockQueued = false;
+            }
+            if (!blockQueued && now - blockSince > std::chrono::milliseconds(1500)) {
+                blockQueued = true;
+                const auto seen = seenAt.find("block:" + blockKey);
+                if (seen == seenAt.end() || now - seen->second > std::chrono::minutes(4)) {
+                    seenAt["block:" + blockKey] = now;
+                    char hint[200];
+                    std::snprintf(hint, sizeof(hint), "The player is looking at the block %s, %.0f meters away.",
+                                  s.target.name.c_str(), s.target.dist);
+                    queueInsight(hint, false, now);
+                }
+            }
+        } else if (s.target.kind != Target::Kind::Block) {
+            blockKey.clear();
+        }
+
+        // 3) New hostiles close by.
         int count = 0;
         const Contact* nearest = nullptr;
         std::vector<std::pair<std::string, int>> groups;
@@ -2597,14 +2793,26 @@ private:
                 list += std::to_string(groups[i].second) + " " + groups[i].first;
                 if (!indo && groups[i].second > 1 && groups[i].first.back() != 's') list += "s";
             }
-            char text[220];
             const std::string where = direction(relativeName(nearest->dx, nearest->dz, s.yaw), indo);
-            std::snprintf(text, sizeof(text), indo ? "Peringatan. %s. Terdekat %.0f meter, %s."
-                                                   : "Warning. %s. Nearest %.0f meters, %s.",
-                          list.c_str(), nearest->dist, where.c_str());
-            announce(text, true);
+            if (autoReport) {
+                char text[220];
+                std::snprintf(text, sizeof(text), indo ? "Peringatan. %s. Terdekat %.0f meter, %s."
+                                                       : "Warning. %s. Nearest %.0f meters, %s.",
+                              list.c_str(), nearest->dist, where.c_str());
+                std::string full = text;
+                if (tipsLocally) {
+                    if (const char* tip = tipFor(nearest->type, indo)) full += std::string(" ") + tip;
+                }
+                announce(full, true);
+            }
+            char hint[260];
+            std::snprintf(hint, sizeof(hint), "Hostile mobs just came within %.0f meters: %s. The nearest is %.0f meters away, %s.",
+                          warnRadius, list.c_str(), nearest->dist, relativeName(nearest->dx, nearest->dz, s.yaw));
+            queueInsight(hint, true, now);
         }
         lastHostileCount = count;
+
+        flushInsight(now);
     }
 
     std::string reportText;
@@ -2617,6 +2825,17 @@ private:
     Clock::time_point lastTargetReport{};
     Clock::time_point lastThreatReport{};
     int lastHostileCount = 0;
+
+    static constexpr int kMaxInsights = 200;   // per session; keeps free-tier quotas safe
+    std::string pendingHint;
+    bool pendingUrgent = false;
+    Clock::time_point insightAt{};
+    Clock::time_point lastInsightAt{};
+    int insightCount = 0;
+    std::map<std::string, Clock::time_point> seenAt;
+    std::string blockKey;
+    Clock::time_point blockSince{};
+    bool blockQueued = false;
 
     std::string pending;
     std::chrono::steady_clock::time_point pendingAt{};
@@ -2700,17 +2919,18 @@ inline void registerModules() {
             std::fprintf(stderr, "[Jarvis] Mod Menu rejected module %s\n", panel->id.c_str());
         }
         if (panel->id == "jarvis.ai") {
-            // On-screen button: one tap asks Jarvis for a threat assessment.
-            const bool buttonRegistered = pl::modmenu::ButtonBuilder("jarvis.ai.scan", "Jarvis AI Scan")
+            // On-screen button: one tap asks Jarvis about whatever you are looking at (no typing).
+            const bool buttonRegistered = pl::modmenu::ButtonBuilder("jarvis.ai.scan", "Ask Jarvis")
                 .moduleId(panel->id)
-                .label("AI")
+                .label("Ask Jarvis")
                 .behavior(pl::modmenu::ButtonBehavior::Click)
                 .stylePreset(pl::modmenu::ButtonStylePreset::Accent)
+                .sizeScale(2.2f, 1.0f)
                 .onEvent([](std::string_view, pl::modmenu::ButtonEvent event, float) {
                     if (event != pl::modmenu::ButtonEvent::Click) return;
                     if (!core().started) return;
                     if (auto* aiPanel = dynamic_cast<AiPanel*>(findPanel("jarvis.ai"))) {
-                        if (aiPanel->enabled) aiPanel->scan();
+                        if (aiPanel->enabled) aiPanel->ask();
                     }
                 })
                 .registerButton();
