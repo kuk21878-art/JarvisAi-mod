@@ -102,6 +102,11 @@ struct Snapshot {
     float nearestHostile = -1.f;
     Target target;
     HeldItem held;
+    // Damage inferred from the player's movement (the real health value is not readable).
+    std::int64_t damageSeq = 0;           // grows by one per inferred damage event
+    int damageKind = 0;                   // 1 hit (knockback), 2 fall, 3 blast / heavy hit
+    float damageFall = 0.f;               // estimated fall damage in HP (kind 2)
+    std::string damageSource;             // nearest hostile type when it happened (may be empty)
 };
 
 struct Settings {
@@ -118,6 +123,10 @@ struct Settings {
     std::atomic<float> glowRange{40.f};
     std::atomic<float> chaseRange{0.f};      // > 0: scan this far for mobs that chase the player
     std::atomic<float> arFov{70.f};          // vertical field of view shared by the AR overlays
+    std::atomic<bool> needTactics{false};    // the Tactics module wants every hostile around + damage tracking
+    std::atomic<float> tacticsRange{48.f};
+    std::atomic<float> damageSens{1.f};
+    std::atomic<std::int64_t> pulseAtMs{0};  // steady-clock stamp of the last Scan Pulse request
 };
 
 namespace detail {
@@ -625,6 +634,224 @@ inline void updateTrack(MobTrack& track, float px, float pz, const jsdk::Vec3& m
     track.wx = px; track.wz = pz; track.dist = dist; track.at = now;
 }
 
+// ---------------------------------------------------------------------------
+// Tactics: danger score, target priority, escape route and damage inference
+// ---------------------------------------------------------------------------
+//
+// None of this reads a health value from the game (neither the player's nor a mob's current
+// health can be read in this version). Everything is derived from what a mob IS (vanilla max
+// health + typical damage per hit) and from how the player moves.
+
+struct MobBurst { std::string_view name; float damage; };
+// Rough damage (in HP, half-hearts) of one typical hit or volley on Normal difficulty, no armour.
+inline constexpr MobBurst kMobBurst[] = {
+    {"zombie", 3}, {"husk", 3}, {"drowned", 4}, {"zombie_villager", 3}, {"zombie_villager_v2", 3},
+    {"zombified_piglin", 8}, {"zombie_pigman", 8}, {"skeleton", 4}, {"stray", 4}, {"bogged", 4},
+    {"wither_skeleton", 8}, {"creeper", 20}, {"spider", 2}, {"cave_spider", 2}, {"enderman", 7},
+    {"endermite", 2}, {"witch", 6}, {"blaze", 5}, {"ghast", 6}, {"phantom", 3}, {"slime", 3},
+    {"magma_cube", 5}, {"silverfish", 1}, {"vex", 9}, {"vindicator", 13}, {"pillager", 5},
+    {"evoker", 6}, {"ravager", 12}, {"guardian", 6}, {"elder_guardian", 10}, {"hoglin", 6},
+    {"zoglin", 6}, {"piglin", 6}, {"piglin_brute", 13}, {"breeze", 4}, {"creaking", 6},
+    {"warden", 30}, {"wither", 12}, {"ender_dragon", 10}, {"iron_golem", 15}, {"shulker", 4},
+};
+
+inline float mobBurst(std::string_view type) {
+    for (const auto& entry : kMobBurst) {
+        if (entry.name == type) return entry.damage;
+    }
+    return 4.f;
+}
+
+// How dangerous a hostile is on its own, regardless of distance. Mostly max health, plus damage.
+//   zombie ~22, skeleton ~26, enderman ~48, creeper ~82, ravager ~102, wither ~222, warden ~405.
+inline float dangerScore(const Contact& c) {
+    if (!c.hostile || c.player) return 0.f;
+    float hp = 0.f;
+    if (c.type.empty() || !mobMaxHealth(c.type, hp)) return 30.f;   // unknown hostile
+    return hp * 0.6f + mobBurst(c.type) * 3.5f;
+}
+
+struct Ranked {
+    std::size_t index = 0;
+    float score = 0.f;
+};
+
+// Which hostile should be dealt with first: dangerous per bit of health (quick to kill), and close.
+inline std::vector<Ranked> rankTargets(const std::vector<Contact>& contacts, float maxDist) {
+    std::vector<Ranked> out;
+    for (std::size_t i = 0; i < contacts.size(); ++i) {
+        const Contact& c = contacts[i];
+        if (!c.hostile || c.player || c.dist > maxDist) continue;
+        float hp = 20.f;
+        float burst = 4.f;
+        if (!c.type.empty()) {
+            mobMaxHealth(c.type, hp);
+            burst = mobBurst(c.type);
+        }
+        const float near = 1.f / (1.f + (c.dist / 6.f) * (c.dist / 6.f));
+        float score = (burst + 1.f) / std::sqrt(std::max(hp, 4.f)) * near * 10.f;
+        if (c.chasing) score *= 1.5f;
+        out.push_back({i, score});
+    }
+    std::sort(out.begin(), out.end(), [](const Ranked& a, const Ranked& b) { return a.score > b.score; });
+    return out;
+}
+
+inline constexpr int kEscapeDirs = 16;
+
+struct Escape {
+    bool active = false;
+    int dir = -1;            // index 0..15 (world angle dir * 22.5 degrees from +X towards +Z)
+    float ux = 0.f, uz = 0.f;   // unit vector of the way to run (world)
+    float risk = 0.f;
+    int threats = 0;         // hostiles taken into account
+};
+
+// Picks the direction that leads away from the weighted sum of nearby hostiles. It knows nothing
+// about walls, cliffs or lava: it is a heading suggestion, not a path.
+inline Escape computeEscape(const Snapshot& s, int previousDir) {
+    Escape out;
+    int near20 = 0;
+    bool chaserClose = false, dangerClose = false;
+    float nearest = 1e9f;
+    for (const auto& c : s.contacts) {
+        if (!c.hostile || c.player) continue;
+        const float flat = std::sqrt(c.dx * c.dx + c.dz * c.dz);
+        if (flat <= 20.f) ++near20;
+        if (c.chasing && flat <= 25.f) chaserClose = true;
+        if (flat <= 30.f && dangerScore(c) >= 70.f) dangerClose = true;
+        nearest = std::min(nearest, flat);
+    }
+    out.active = near20 >= 3 || chaserClose || dangerClose || nearest < 8.f;
+    if (!out.active) return out;
+
+    constexpr float kTwoPi = 6.28318530718f;
+    float risk[kEscapeDirs] = {};
+    for (const auto& c : s.contacts) {
+        if (!c.hostile || c.player) continue;
+        const float len = std::sqrt(c.dx * c.dx + c.dz * c.dz);
+        if (len > 30.f || len < 0.01f) continue;
+        ++out.threats;
+        const float weight = std::min(dangerScore(c), 200.f) / 30.f / (1.f + (len / 8.f) * (len / 8.f)) *
+                             (c.chasing ? 1.6f : 1.f);
+        const float mx = c.dx / len, mz = c.dz / len;
+        for (int k = 0; k < kEscapeDirs; ++k) {
+            const float angle = kTwoPi * static_cast<float>(k) / static_cast<float>(kEscapeDirs);
+            const float cosine = std::cos(angle) * mx + std::sin(angle) * mz;
+            const float exposure = (1.f + cosine) * 0.5f;
+            risk[k] += weight * exposure * exposure;
+        }
+    }
+    int best = 0;
+    for (int k = 1; k < kEscapeDirs; ++k) {
+        if (risk[k] < risk[best]) best = k;
+    }
+    // Hysteresis: keep the previous heading unless the new one is clearly safer (no flicker).
+    if (previousDir >= 0 && previousDir < kEscapeDirs && risk[previousDir] <= risk[best] * 1.15f + 0.02f) {
+        best = previousDir;
+    }
+    const float angle = kTwoPi * static_cast<float>(best) / static_cast<float>(kEscapeDirs);
+    out.dir = best;
+    out.ux = std::cos(angle);
+    out.uz = std::sin(angle);
+    out.risk = risk[best];
+    return out;
+}
+
+// Yaw (degrees, 0 = +Z, same convention as the camera) that faces the world direction (ux, uz).
+inline float yawForDirection(float ux, float uz) {
+    return std::atan2(-ux, uz) * 57.29577951308232f;
+}
+
+struct DamageEvent {
+    int kind = 0;        // 0 none, 1 hit (knockback), 2 fall, 3 blast / heavy hit
+    float fall = 0.f;    // estimated fall damage in HP (kind 2)
+    float force = 0.f;   // size of the sudden velocity change (blocks/s)
+};
+
+// Infers damage from how the player's own position changes: a sudden shove away from a nearby
+// hostile (hit / blast), or an abrupt stop after a long drop (fall). The game's real health value is
+// not readable, so this is an estimate and can miss (arrows, poison, fire) or misfire.
+struct DamageDetector {
+    bool have = false;
+    double t0 = 0.0, lastHit = -100.0;
+    float x0 = 0.f, y0 = 0.f, z0 = 0.f;
+    float vx = 0.f, vy = 0.f, vz = 0.f;
+    float vyOld = 0.f;          // vertical velocity two samples ago
+    bool haveV = false;
+    float peakY = 0.f;
+
+    void reset() { *this = DamageDetector{}; }
+
+    // hdx/hdz: horizontal vector from the player to the nearest hostile; hdist < 0: none known.
+    DamageEvent feed(double t, float x, float y, float z, float hdx, float hdz, float hdist, float sensitivity) {
+        DamageEvent event;
+        sensitivity = std::clamp(sensitivity, 0.4f, 2.5f);
+        const float jump = std::sqrt((x - x0) * (x - x0) + (y - y0) * (y - y0) + (z - z0) * (z - z0));
+        if (!have || t - t0 > 0.5 || jump > 12.f) {   // first sample, a pause, or a teleport
+            have = true;
+            t0 = t; x0 = x; y0 = y; z0 = z;
+            vx = vy = vz = vyOld = 0.f;
+            haveV = false;
+            peakY = y;
+            return event;
+        }
+        const float dt = static_cast<float>(t - t0);
+        if (dt < 0.045f) return event;     // the game moves the player 20 times a second
+
+        const float nvx = (x - x0) / dt, nvy = (y - y0) / dt, nvz = (z - z0) / dt;
+        if (haveV) {
+            // Landing: a fast drop that stops within about two samples (water and slow stops do not).
+            const bool stopped = nvy > -2.f && (vy <= -7.f || (vyOld <= -7.f && vy < -2.f));
+            if (stopped) {
+                const float fallen = peakY - y;
+                if (fallen >= 3.5f) {
+                    event.kind = 2;
+                    event.fall = std::ceil(fallen - 3.f);
+                    event.force = -std::min(vy, vyOld);
+                }
+                peakY = y;
+                vy = vyOld = 0.f;
+            } else if (hdist >= 0.f && hdist < 7.f && t - lastHit > 1.2) {
+                const float dvx = nvx - vx, dvz = nvz - vz;
+                const float dvh = std::sqrt(dvx * dvx + dvz * dvz);
+                const float len = std::sqrt(hdx * hdx + hdz * hdz);
+                if (dvh >= 4.5f / sensitivity && len > 0.01f) {
+                    // Speed along the direction away from the hostile, before and after.
+                    const float ax = -hdx / len, az = -hdz / len;
+                    const float awayBefore = vx * ax + vz * az;
+                    const float awayAfter = nvx * ax + nvz * az;
+                    if (awayAfter >= 3.f / sensitivity && awayBefore < 1.5f) {
+                        event.kind = dvh >= 9.f / sensitivity ? 3 : 1;
+                        event.force = dvh;
+                        lastHit = t;
+                    }
+                }
+            }
+        }
+        if (event.kind != 2) {
+            if (y > peakY) peakY = y;
+            if (std::fabs(nvy) < 0.6f) peakY = y;   // standing / walking: the drop starts here
+            vyOld = vy;
+        }
+        vx = nvx; vy = nvy; vz = nvz;
+        haveV = true;
+        t0 = t; x0 = x; y0 = y; z0 = z;
+        return event;
+    }
+};
+
+inline double nowSecondsD() {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+inline std::int64_t steadyMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+// Starts the Scan Pulse animation (the Tactics module listens for this).
+inline void triggerPulse() { core().settings.pulseAtMs.store(steadyMs()); }
+
 inline void scanContacts(jsdk::Player* player, const jsdk::Vec3& me, Snapshot& out) {
     auto& c = core();
     out.contacts.clear();
@@ -633,8 +860,10 @@ inline void scanContacts(jsdk::Player* player, const jsdk::Vec3& me, Snapshot& o
     if (!c.fetchNearby) return;
 
     const bool glow = c.settings.needGlow.load();
+    const bool tactics = c.settings.needTactics.load();
     float range = std::clamp(c.settings.radarRange.load(), 8.f, 180.f);
     if (glow) range = std::max(range, std::clamp(c.settings.glowRange.load(), 8.f, 180.f));
+    if (tactics) range = std::max(range, std::clamp(c.settings.tacticsRange.load(), 8.f, 180.f));
     const unsigned mask = static_cast<unsigned>(c.settings.hostileMask.load());
     const bool showPlayers = c.settings.showPlayers.load();
     const bool showPassive = c.settings.showPassive.load();
@@ -670,7 +899,7 @@ inline void scanContacts(jsdk::Player* player, const jsdk::Vec3& me, Snapshot& o
                               (contact.type.empty() ? (contact.cats & mask) != 0 : isHostileType(contact.type));
 
             // The radar applies these two filters itself when drawing; the glow wants everything.
-            if (!glow) {
+            if (!glow && !tactics) {
                 if (contact.player && !showPlayers) continue;
                 if (!contact.player && !contact.hostile && !showPassive) continue;
             }
@@ -857,8 +1086,9 @@ inline void onTick(jsdk::Player* player) {
     Snapshot scratch;
     const bool aiWants = c.settings.aiNeeds.load();
     const bool glowWants = c.settings.needGlow.load();
-    const bool doRadar = (c.settings.needRadar.load() || aiWants || glowWants) &&
-                         due(c.lastRadar, glowWants ? 50 : kScanIntervalMs);
+    const bool tacticsWants = c.settings.needTactics.load();
+    const bool doRadar = (c.settings.needRadar.load() || aiWants || glowWants || tacticsWants) &&
+                         due(c.lastRadar, glowWants ? 50 : (tacticsWants ? 100 : kScanIntervalMs));
     const bool doTarget = (c.settings.needScanner.load() || aiWants) && due(c.lastTarget, kTargetIntervalMs);
     if (doRadar) scanContacts(player, pos, scratch);
     if (doTarget) {
@@ -882,6 +1112,31 @@ inline void onTick(jsdk::Player* player) {
     if (doTarget) {
         c.snap.target = std::move(scratch.target);
         c.snap.held = std::move(scratch.held);
+    }
+
+    // Damage inference (Tactics): needs the nearest hostile to tell a shove from walking.
+    static DamageDetector detector;
+    if (tacticsWants) {
+        float hdx = 0.f, hdz = 0.f, hdist = -1.f;
+        const Contact* nearestHostile = nullptr;
+        for (const auto& contact : c.snap.contacts) {   // nearest first
+            if (contact.hostile && !contact.player) { nearestHostile = &contact; break; }
+        }
+        if (nearestHostile) {
+            hdx = nearestHostile->dx;
+            hdz = nearestHostile->dz;
+            hdist = std::sqrt(hdx * hdx + hdz * hdz);
+        }
+        const DamageEvent event = detector.feed(nowSecondsD(), pos.x, pos.y, pos.z, hdx, hdz, hdist,
+                                                c.settings.damageSens.load());
+        if (event.kind != 0) {
+            ++c.snap.damageSeq;
+            c.snap.damageKind = event.kind;
+            c.snap.damageFall = event.fall;
+            c.snap.damageSource = (event.kind != 2 && nearestHostile) ? nearestHostile->type : std::string();
+        }
+    } else {
+        detector.reset();
     }
 }
 
@@ -3116,10 +3371,15 @@ public:
         pushNeeds();
     }
 
-    void scan() { submit({}); }
+    void scan() { triggerPulse(); submit({}); }
 
     // The on-screen "Ask Jarvis" button: one tap, no typing.
-    void ask() { submit(quickQuestion); }
+    void ask() { triggerPulse(); submit(quickQuestion); }
+
+    // Used by the Tactics module: same voice, same language.
+    bool isIndonesian() const { return indonesian(); }
+    void speakText(const std::string& text) const { if (voice) voiceSpeak(text, voiceLang); }
+    static std::string localDirection(const char* english, bool indo) { return direction(english, indo); }
 
     void submit(const std::string& question) {
         AiJob job;
@@ -3550,6 +3810,585 @@ private:
 };
 
 // ===========================================================================
+// Jarvis Tactics: escape route, target priority, dangerous mob alert, damage alert, scan pulse
+// ===========================================================================
+
+inline Panel* findPanel(std::string_view id);   // defined below
+
+// Projects one world point. False when it is behind the camera.
+inline bool projectPoint(const Camera& cam, float wx, float wy, float wz, float& sx, float& sy) {
+    const CamPoint p = toCamera(cam, wx, wy, wz);
+    if (p.z < 0.1f) return false;
+    toScreen(cam, p, sx, sy);
+    return std::isfinite(sx) && std::isfinite(sy);
+}
+
+class TacticalPanel : public Panel {
+public:
+    TacticalPanel()
+        : Panel("jarvis.tactics", "Jarvis Tactics",
+                "Combat advisor: escape route, target priority, dangerous mob alerts (by max health), damage alerts and a scan pulse.",
+                0.f, 0.f) {}
+
+    bool escapeRoute = true;
+    bool priorityTarget = true;
+    bool dangerAlert = true;
+    bool damageAlert = true;
+    bool scanPulse = true;
+    bool speak = true;               // read the alerts aloud with the Jarvis voice
+    float range = 48.f;              // how far away hostiles are considered
+    float pulseRange = 24.f;         // how far the scan pulse reaches
+    float dangerThreshold = 70.f;    // danger score that triggers the alert (zombie 22, creeper 82, ravager 102)
+    float damageSensitivity = 1.f;   // higher = reacts to weaker shoves
+
+    void pushSettings() {
+        auto& s = core().settings;
+        s.needTactics = enabled;
+        s.tacticsRange = std::clamp(std::max(range, pulseRange), 10.f, 120.f);
+        s.damageSens = damageSensitivity;
+    }
+
+    void onEnabledChanged() override { pushSettings(); }
+
+    std::vector<ConfigEntry> entries() const override {
+        auto list = Panel::entries();
+        list.push_back(toggleEntry("escapeRoute", "Escape Route", escapeRoute));
+        list.push_back(toggleEntry("priorityTarget", "Target Priority", priorityTarget));
+        list.push_back(toggleEntry("dangerAlert", "Dangerous Mob Alert", dangerAlert));
+        list.push_back(toggleEntry("damageAlert", "Damage Alert (estimated)", damageAlert));
+        list.push_back(toggleEntry("scanPulse", "Scan Pulse", scanPulse));
+        list.push_back({"pulseNow", "Pulse Now", pl::modmenu::ConfigType::Button, "false", "", ""});
+        list.push_back(toggleEntry("speak", "Speak Alerts (voice)", speak));
+        list.push_back(floatEntry("range", "Threat Range (blocks)", range, 15.f, 100.f));
+        list.push_back(floatEntry("pulseRange", "Pulse Range (blocks)", pulseRange, 10.f, 60.f));
+        list.push_back(floatEntry("dangerThreshold", "Danger Threshold (lower = more alerts)", dangerThreshold, 30.f, 200.f));
+        list.push_back(floatEntry("damageSensitivity", "Damage Sensitivity", damageSensitivity, 0.5f, 2.f));
+        return list;
+    }
+
+    bool set(const std::string& key, std::string_view value) override {
+        if (Panel::set(key, value)) return true;
+        if (key == "escapeRoute") return parseBool(value, escapeRoute);
+        if (key == "priorityTarget") return parseBool(value, priorityTarget);
+        if (key == "dangerAlert") return parseBool(value, dangerAlert);
+        if (key == "damageAlert") return parseBool(value, damageAlert);
+        if (key == "scanPulse") return parseBool(value, scanPulse);
+        if (key == "speak") return parseBool(value, speak);
+        if (key == "pulseNow") {
+            // Ignore the callbacks the menu may fire while it registers the control.
+            if (Clock::now() - createdAt > std::chrono::seconds(4)) triggerPulse();
+            return false;
+        }
+        if (key == "range") { const bool ok = parseFloat(value, range); pushSettings(); return ok; }
+        if (key == "pulseRange") { const bool ok = parseFloat(value, pulseRange); pushSettings(); return ok; }
+        if (key == "dangerThreshold") return parseFloat(value, dangerThreshold);
+        if (key == "damageSensitivity") { const bool ok = parseFloat(value, damageSensitivity); pushSettings(); return ok; }
+        return false;
+    }
+
+    void toJson(nlohmann::json& j) const override {
+        Panel::toJson(j);
+        j["escapeRoute"] = escapeRoute;
+        j["priorityTarget"] = priorityTarget;
+        j["dangerAlert"] = dangerAlert;
+        j["damageAlert"] = damageAlert;
+        j["scanPulse"] = scanPulse;
+        j["speak"] = speak;
+        j["range"] = range;
+        j["pulseRange"] = pulseRange;
+        j["dangerThreshold"] = dangerThreshold;
+        j["damageSensitivity"] = damageSensitivity;
+    }
+
+    void fromJson(const nlohmann::json& j) override {
+        Panel::fromJson(j);
+        if (j.contains("escapeRoute")) escapeRoute = j["escapeRoute"].get<bool>();
+        if (j.contains("priorityTarget")) priorityTarget = j["priorityTarget"].get<bool>();
+        if (j.contains("dangerAlert")) dangerAlert = j["dangerAlert"].get<bool>();
+        if (j.contains("damageAlert")) damageAlert = j["damageAlert"].get<bool>();
+        if (j.contains("scanPulse")) scanPulse = j["scanPulse"].get<bool>();
+        if (j.contains("speak")) speak = j["speak"].get<bool>();
+        if (j.contains("range")) range = j["range"].get<float>();
+        if (j.contains("pulseRange")) pulseRange = j["pulseRange"].get<float>();
+        if (j.contains("dangerThreshold")) dangerThreshold = j["dangerThreshold"].get<float>();
+        if (j.contains("damageSensitivity")) damageSensitivity = j["damageSensitivity"].get<float>();
+        pushSettings();
+    }
+
+    void draw(const Snapshot& s) override {
+        const auto surface = pl::modmenu::getHudSurfaceSize();
+        if (!s.valid || !(surface.width > 100.f) || !(surface.height > 100.f)) {
+            clear();
+            return;
+        }
+        const double t = nowSecondsD();
+        const bool indo = indonesian();
+        const float W = surface.width, H = surface.height;
+        const Camera cam = makeCamera(s, core().settings.arFov.load(), W, H);
+        const float reach = std::clamp(range, 10.f, 120.f);
+        Canvas canvas;
+
+        // ---- damage alert -------------------------------------------------------------------
+        if (!seenDamage) {
+            seenDamage = true;
+            lastDamageSeq = s.damageSeq;     // do not replay what happened before the module was on
+        } else if (s.damageSeq != lastDamageSeq) {
+            lastDamageSeq = s.damageSeq;
+            if (damageAlert) onDamage(s, t, indo);
+        }
+
+        // ---- dangerous mob ------------------------------------------------------------------
+        const Contact* danger = nullptr;
+        float dangerBest = 0.f;
+        for (const auto& c : s.contacts) {
+            if (!dangerAlert || !c.hostile || c.player || c.dist > reach) continue;
+            const float score = dangerScore(c);
+            if (score >= dangerThreshold && score / (1.f + (c.dist / 25.f) * (c.dist / 25.f)) > dangerBest) {
+                dangerBest = score / (1.f + (c.dist / 25.f) * (c.dist / 25.f));
+                danger = &c;
+            }
+        }
+        if (dangerAlert && danger) {
+            auto& last = dangerSeen[danger->id];
+            if (t - last > 40.0 && t - lastDangerAt > 6.0) {
+                last = t;
+                lastDangerAt = t;
+                announceDanger(s, *danger, t, indo);
+            }
+        }
+        if (dangerSeen.size() > 48) {
+            for (auto it = dangerSeen.begin(); it != dangerSeen.end();) {
+                it = t - it->second > 120.0 ? dangerSeen.erase(it) : std::next(it);
+            }
+        }
+
+        // ---- target priority ----------------------------------------------------------------
+        std::vector<Ranked> ranked;
+        if (priorityTarget) {
+            ranked = rankTargets(s.contacts, std::min(24.f, reach));
+            if (ranked.size() < 2) ranked.clear();   // nothing to choose between
+        }
+        if (!ranked.empty()) {
+            const Contact& top = s.contacts[ranked[0].index];
+            if (top.id != priorityId) {
+                priorityId = top.id;
+                prioritySince = t;
+                priorityAnnounced = false;
+            }
+            if (!priorityAnnounced && t - prioritySince > 0.6 && t - lastPriorityAt > 8.0) {
+                priorityAnnounced = true;
+                lastPriorityAt = t;
+                announcePriority(s, top, t, indo);
+            }
+        } else {
+            priorityId = 0;
+        }
+
+        // ---- escape route -------------------------------------------------------------------
+        Escape escape;
+        if (escapeRoute) {
+            escape = computeEscape(s, escapeDir);
+            if (escape.active) {
+                if (!escapeOn && t - lastEscapeAt > 12.0) {
+                    lastEscapeAt = t;
+                    announceEscape(s, escape, t, indo);
+                }
+                escapeOn = true;
+                escapeDir = escape.dir;
+            } else {
+                escapeOn = false;
+                escapeDir = -1;
+            }
+        }
+
+        // ---- scan pulse (started by "Ask Jarvis" or the Pulse Now button) -------------------
+        const std::int64_t pulseStamp = core().settings.pulseAtMs.load();
+        if (!seenPulse) {
+            seenPulse = true;
+            lastPulseStamp = pulseStamp;
+        } else if (pulseStamp != lastPulseStamp) {
+            lastPulseStamp = pulseStamp;
+            if (scanPulse) startPulse(s, t, indo);
+        }
+
+        // ================= drawing =================
+        drawFlash(canvas, W, H, t);
+        if (pulseActive) drawPulse(canvas, s, cam, surface, t);
+        if (escape.active) drawEscape(canvas, s, cam, escape, W, H, indo);
+        drawMarkers(canvas, s, cam, ranked, danger, surface);
+        drawBanner(canvas, W, H, t);
+        canvas.submit(id);
+    }
+
+private:
+    using Clock = std::chrono::steady_clock;
+
+    // ---- state ----
+    Clock::time_point createdAt = Clock::now();
+    bool seenDamage = false, seenPulse = false;
+    std::int64_t lastDamageSeq = 0, lastPulseStamp = 0;
+    std::map<std::uintptr_t, double> dangerSeen;
+    double lastDangerAt = -100.0, lastPriorityAt = -100.0, lastEscapeAt = -100.0;
+    std::uintptr_t priorityId = 0;
+    double prioritySince = 0.0;
+    bool priorityAnnounced = false;
+    bool escapeOn = false;
+    int escapeDir = -1;
+
+    // banner
+    std::string bannerText;
+    std::uint32_t bannerColor = kCyan;
+    double bannerUntil = 0.0;
+    int bannerPrio = 0;
+
+    // red flash when damaged
+    double flashAt = -100.0;
+    float flashPower = 0.f;
+
+    // pulse
+    bool pulseActive = false;
+    double pulseStart = 0.0;
+    std::map<std::uintptr_t, double> revealed;
+    static constexpr double kPulseSeconds = 1.6;
+    static constexpr double kRevealSeconds = 1.4;
+
+    bool indonesian() const {
+        if (auto* ai = dynamic_cast<AiPanel*>(findPanel("jarvis.ai"))) return ai->isIndonesian();
+        return false;
+    }
+
+    void say(const std::string& text) const {
+        if (!speak) return;
+        if (auto* ai = dynamic_cast<AiPanel*>(findPanel("jarvis.ai"))) ai->speakText(text);
+    }
+
+    void banner(const std::string& text, std::uint32_t color, double now, double seconds, int prio) {
+        if (now < bannerUntil && prio < bannerPrio) return;
+        bannerText = text;
+        bannerColor = color;
+        bannerUntil = now + seconds;
+        bannerPrio = prio;
+    }
+
+    static std::string niceName(const Contact& c) {
+        if (c.type.empty()) return c.hostile ? "Hostile mob" : "Mob";
+        std::string out = c.type;
+        for (auto& ch : out) ch = ch == '_' ? ' ' : static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        out[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(out[0])));
+        return out;
+    }
+
+    static std::string where(const Snapshot& s, const Contact& c, bool indo) {
+        return AiPanel::localDirection(relativeName(c.dx, c.dz, s.yaw), indo);
+    }
+
+    static std::string compassWord(const char* english, bool indo) {
+        if (!indo) return english;
+        static const std::pair<const char*, const char*> map[] = {
+            {"north-east", "timur laut"}, {"north-west", "barat laut"}, {"south-east", "tenggara"},
+            {"south-west", "barat daya"}, {"north", "utara"}, {"east", "timur"}, {"south", "selatan"}, {"west", "barat"}};
+        for (const auto& entry : map) {
+            if (std::string_view(english) == entry.first) return entry.second;
+        }
+        return english;
+    }
+
+    void onDamage(const Snapshot& s, double now, bool indo) {
+        std::string source;
+        float burst = 0.f;
+        if (!s.damageSource.empty()) {
+            source = s.damageSource;
+            for (auto& ch : source) ch = ch == '_' ? ' ' : static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+            source[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(source[0])));
+            burst = mobBurst(s.damageSource);
+        }
+        std::string text, spoken;
+        char buf[160];
+        if (s.damageKind == 2) {
+            std::snprintf(buf, sizeof(buf), indo ? "JATUH! Perkiraan -%.0f HP (%.1f hati)" : "FALL DAMAGE! Estimated -%.0f HP (%.1f hearts)",
+                          s.damageFall, s.damageFall * 0.5f);
+            text = buf;
+            spoken = indo ? "Kamu jatuh. Perkiraan kerusakan " + std::to_string(static_cast<int>(s.damageFall)) + " HP."
+                          : "Fall damage. About " + std::to_string(static_cast<int>(s.damageFall)) + " hit points.";
+            flashPower = std::clamp(s.damageFall / 8.f, 0.4f, 1.f);
+        } else if (s.damageKind == 3) {
+            const std::string from = source.empty() ? (indo ? "ledakan" : "a blast") : source;
+            text = indo ? "LEDAKAN / SERANGAN BERAT! " + from : "HEAVY HIT / BLAST! " + from;
+            spoken = indo ? "Awas! Serangan berat. " + source : "Heavy hit! " + source;
+            flashPower = 1.f;
+        } else {
+            const std::string from = source.empty() ? (indo ? "musuh" : "an enemy") : source;
+            if (burst > 0.f) {
+                std::snprintf(buf, sizeof(buf), indo ? "TERKENA SERANGAN %s (perkiraan ~%.0f HP)" : "HIT BY %s (est. ~%.0f HP)", from.c_str(), burst);
+            } else {
+                std::snprintf(buf, sizeof(buf), indo ? "TERKENA SERANGAN %s" : "HIT BY %s", from.c_str());
+            }
+            text = buf;
+            spoken = indo ? "Terkena serangan " + from + "." : "Hit by " + from + ".";
+            flashPower = std::clamp(burst / 8.f, 0.4f, 0.9f);
+        }
+        flashAt = now;
+        banner(text, kRed, now, 3.0, 4);
+        say(spoken);
+    }
+
+    void announceDanger(const Snapshot& s, const Contact& c, double now, bool indo) {
+        float hp = 0.f;
+        const bool known = !c.type.empty() && mobMaxHealth(c.type, hp);
+        char buf[220];
+        const std::string name = niceName(c);
+        const std::string dir = where(s, c, indo);
+        std::string text;
+        if (known) {
+            std::snprintf(buf, sizeof(buf), indo ? "MOB BERBAHAYA: %s, HP %.0f (%.0f hati), %.0f meter, %s" : "DANGEROUS MOB: %s, %.0f HP (%.0f hearts), %.0f meters, %s",
+                          name.c_str(), hp, hp * 0.5f, c.dist, dir.c_str());
+        } else {
+            std::snprintf(buf, sizeof(buf), indo ? "MOB BERBAHAYA: %s, %.0f meter, %s" : "DANGEROUS MOB: %s, %.0f meters, %s", name.c_str(), c.dist, dir.c_str());
+        }
+        text = buf;
+        if (c.chasing) text += indo ? " - MENGEJAR!" : " - CHASING YOU!";
+        std::string spoken;
+        if (known) {
+            std::snprintf(buf, sizeof(buf), indo ? "Peringatan. Mob berbahaya. %s, %.0f HP, %.0f meter di %s." : "Warning. Dangerous mob. %s, %.0f hit points, %.0f meters %s.",
+                          name.c_str(), hp, c.dist, dir.c_str());
+        } else {
+            std::snprintf(buf, sizeof(buf), indo ? "Peringatan. Mob berbahaya. %s, %.0f meter di %s." : "Warning. Dangerous mob. %s, %.0f meters %s.", name.c_str(), c.dist, dir.c_str());
+        }
+        spoken = buf;
+        banner(text, kRed, now, 6.0, 3);
+        say(spoken);
+    }
+
+    void announcePriority(const Snapshot& s, const Contact& c, double now, bool indo) {
+        char buf[200];
+        const std::string name = niceName(c);
+        const std::string dir = where(s, c, indo);
+        std::snprintf(buf, sizeof(buf), indo ? "TARGET UTAMA: %s, %.0f meter, %s" : "PRIORITY TARGET: %s, %.0f meters, %s", name.c_str(), c.dist, dir.c_str());
+        banner(buf, kAmber, now, 4.0, 2);
+        std::snprintf(buf, sizeof(buf), indo ? "Target utama. %s, %.0f meter di %s." : "Priority target. %s, %.0f meters %s.", name.c_str(), c.dist, dir.c_str());
+        say(buf);
+    }
+
+    void announceEscape(const Snapshot&, const Escape& e, double now, bool indo) {
+        const std::string compass = compassWord(headingName(yawForDirection(e.ux, e.uz)), indo);
+        const std::string text = (indo ? "RUTE KABUR: lari ke " : "ESCAPE ROUTE: run ") + compass;
+        banner(text, kGreen, now, 4.0, 1);
+        say((indo ? "Rute kabur. Lari ke " : "Escape route. Run ") + compass + ".");
+    }
+
+    void startPulse(const Snapshot& s, double now, bool indo) {
+        pulseActive = true;
+        pulseStart = now;
+        revealed.clear();
+        int hostile = 0, other = 0;
+        for (const auto& c : s.contacts) {
+            if (c.dist > pulseRange) continue;
+            if (c.hostile) ++hostile; else ++other;
+        }
+        char buf[160];
+        std::snprintf(buf, sizeof(buf), indo ? "SCAN: %d musuh, %d lainnya dalam %.0f meter" : "SCAN: %d hostile, %d other within %.0f meters", hostile, other, pulseRange);
+        banner(buf, kCyan, now, 3.0, 1);
+    }
+
+    // ---- drawing helpers ----
+
+    void drawFlash(Canvas& canvas, float W, float H, double now) const {
+        const float age = static_cast<float>(now - flashAt);
+        if (age < 0.f || age > 0.7f) return;
+        const float fade = (1.f - age / 0.7f) * flashPower;
+        const float edge = std::min(W, H) * 0.06f;
+        for (int layer = 0; layer < 3; ++layer) {
+            const float thick = edge * static_cast<float>(layer + 1) / 3.f;
+            const std::uint32_t color = argb(0.22f * fade, kRed);
+            canvas.rect(0.f, 0.f, W, thick, color);
+            canvas.rect(0.f, H - thick, W, thick, color);
+            canvas.rect(0.f, thick, thick, H - 2.f * thick, color);
+            canvas.rect(W - thick, thick, thick, H - 2.f * thick, color);
+        }
+    }
+
+    // Draws the 12 edges of a mob's box. Returns false when it is off screen / behind us.
+    static bool drawBox(Canvas& canvas, const Camera& cam, const Contact& c, std::uint32_t color, float alpha, float sc,
+                        float W, float H, float& left, float& top, float& right, float& bottom) {
+        const float xs[2] = {c.wx - c.width * 0.5f, c.wx + c.width * 0.5f};
+        const float ys[2] = {c.wy, c.wy + c.height};
+        const float zs[2] = {c.wz - c.width * 0.5f, c.wz + c.width * 0.5f};
+        struct Seg { float x1, y1, x2, y2; };
+        Seg segs[12];
+        int count = 0;
+        left = 1e9f; right = -1e9f; top = 1e9f; bottom = -1e9f;
+        auto edge = [&](int ax, int ay, int az, int bx, int by, int bz) {
+            Seg seg;
+            if (!projectSegment(cam, xs[ax], ys[ay], zs[az], xs[bx], ys[by], zs[bz], seg.x1, seg.y1, seg.x2, seg.y2)) return;
+            segs[count++] = seg;
+            left = std::min({left, seg.x1, seg.x2}); right = std::max({right, seg.x1, seg.x2});
+            top = std::min({top, seg.y1, seg.y2}); bottom = std::max({bottom, seg.y1, seg.y2});
+        };
+        for (int a = 0; a < 2; ++a) {
+            for (int b = 0; b < 2; ++b) {
+                edge(0, a, b, 1, a, b);
+                edge(a, 0, b, a, 1, b);
+                edge(a, b, 0, a, b, 1);
+            }
+        }
+        if (count == 0 || right < 0.f || left > W || bottom < 0.f || top > H) return false;
+        for (int i = 0; i < count; ++i) canvas.line(segs[i].x1, segs[i].y1, segs[i].x2, segs[i].y2, 4.f * sc, argb(0.18f * alpha, color));
+        for (int i = 0; i < count; ++i) canvas.line(segs[i].x1, segs[i].y1, segs[i].x2, segs[i].y2, 1.6f * sc, argb(std::min(1.f, 0.95f * alpha), color));
+        return true;
+    }
+
+    void drawPulse(Canvas& canvas, const Snapshot& s, const Camera& cam, const pl::modmenu::HudSurfaceSize& surface, double now) {
+        const float W = surface.width, H = surface.height;
+        const float sc = scale;
+        const float p = static_cast<float>((now - pulseStart) / kPulseSeconds);
+        const float eased = 1.f - (1.f - std::clamp(p, 0.f, 1.f)) * (1.f - std::clamp(p, 0.f, 1.f));
+        const float radius = pulseRange * eased;
+        const float feet = s.y - 1.62f + 0.05f;
+
+        // expanding ground ring (only while the wave travels)
+        if (p <= 1.f) {
+            constexpr int kSegments = 40;
+            constexpr float kTwoPi = 6.28318530718f;
+            const float fade = 1.f - 0.6f * p;
+            float px = s.x + radius, pz = s.z;
+            for (int i = 1; i <= kSegments; ++i) {
+                const float a = kTwoPi * static_cast<float>(i) / static_cast<float>(kSegments);
+                const float nx = s.x + std::cos(a) * radius, nz = s.z + std::sin(a) * radius;
+                float x1, y1, x2, y2;
+                if (projectSegment(cam, px, feet, pz, nx, feet, nz, x1, y1, x2, y2)) {
+                    canvas.line(x1, y1, x2, y2, 7.f * sc, argb(0.16f * fade, kCyan));
+                    canvas.line(x1, y1, x2, y2, 2.2f * sc, argb(0.95f * fade, kCyan));
+                }
+                px = nx; pz = nz;
+            }
+        }
+
+        // mobs touched by the wave light up for a moment
+        for (const auto& c : s.contacts) {
+            if (c.dist > pulseRange) continue;
+            if (revealed.size() >= 14 && !revealed.count(c.id)) continue;
+            if (c.dist <= radius && !revealed.count(c.id)) revealed[c.id] = now;
+        }
+        for (const auto& c : s.contacts) {
+            auto it = revealed.find(c.id);
+            if (it == revealed.end()) continue;
+            const float age = static_cast<float>(now - it->second);
+            if (age > kRevealSeconds) continue;
+            const float alpha = 1.f - age / static_cast<float>(kRevealSeconds);
+            const std::uint32_t color = c.hostile ? kRed : (c.player ? kWhite : kCyan);
+            float left, top, right, bottom;
+            if (!drawBox(canvas, cam, c, color, alpha, sc, W, H, left, top, right, bottom)) continue;
+            std::string label = c.player ? std::string("PLAYER") : niceName(c);
+            label += formatFloat("  %.0fm", c.dist);
+            const float size = 14.f * sc;
+            const float w = textWidth(label, size);
+            const float x = std::clamp((left + right) * 0.5f - w * 0.5f, 4.f, W - w - 4.f);
+            const float y = std::clamp(bottom + 4.f * sc, 4.f, H - size - 4.f);
+            canvas.text(x, y, size, argb(alpha, color), label);
+        }
+        if (p > 1.f && now - pulseStart > kPulseSeconds + kRevealSeconds) {
+            pulseActive = false;
+            revealed.clear();
+        }
+    }
+
+    void drawEscape(Canvas& canvas, const Snapshot& s, const Camera& cam, const Escape& e, float W, float H, bool indo) const {
+        const float sc = scale;
+        constexpr float kDeg = 0.017453292519943295f;
+        const float yaw = s.yaw * kDeg;
+        const float front = e.ux * (-std::sin(yaw)) + e.uz * std::cos(yaw);
+        const float side = e.ux * (-std::cos(yaw)) + e.uz * (-std::sin(yaw));
+        const float len = std::sqrt(front * front + side * side);
+        const std::uint32_t color = kGreen;
+        const float pulse = 0.8f + 0.2f * std::sin(static_cast<float>(nowSeconds()) * 6.f);
+
+        // Compass-style arrow at the lower centre of the screen (up = straight ahead).
+        const float cx = W * 0.5f, cy = H * 0.74f, R = 44.f * sc;
+        canvas.circle(cx, cy, R * 1.25f, argb(0.45f * opacity, kPanelColor));
+        canvas.ring(cx, cy, R * 1.25f, 1.6f * sc, argb(0.8f, kCyanDim), 40);
+        if (len > 0.05f) {
+            const float dx = side / len, dy = -front / len;       // screen direction
+            const float nx = -dy, ny = dx;                        // perpendicular
+            const float tipX = cx + dx * R, tipY = cy + dy * R;
+            const float baseX = cx - dx * R * 0.35f, baseY = cy - dy * R * 0.35f;
+            canvas.line(baseX, baseY, cx + dx * R * 0.5f, cy + dy * R * 0.5f, 7.f * sc, argb(0.9f * pulse, color));
+            canvas.triangle(tipX, tipY, baseX + nx * R * 0.55f + dx * R * 0.35f, baseY + ny * R * 0.55f + dy * R * 0.35f,
+                            baseX - nx * R * 0.55f + dx * R * 0.35f, baseY - ny * R * 0.55f + dy * R * 0.35f, argb(0.95f * pulse, color));
+        }
+        std::string label = (indo ? "KABUR " : "ESCAPE ") + compassWord(headingName(yawForDirection(e.ux, e.uz)), indo);
+        for (auto& ch : label) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+        const float size = 15.f * sc;
+        canvas.text(cx - textWidth(label, size) * 0.5f, cy + R * 1.25f + 6.f * sc, size, argb(1.f, color), label);
+
+        // The same heading drawn on the ground in front of you.
+        const float feet = s.y - 1.62f + 0.06f;
+        const float sx = s.x + e.ux * 2.5f, sz = s.z + e.uz * 2.5f;
+        const float ex = s.x + e.ux * 9.f, ez = s.z + e.uz * 9.f;
+        const float px = -e.uz, pz = e.ux;                        // sideways in world space
+        const float wing = 0.9f;
+        const float hx = ex - e.ux * 1.6f, hz = ez - e.uz * 1.6f;
+        struct Line3 { float ax, az, bx, bz; };
+        const Line3 lines[] = {{sx, sz, ex, ez}, {ex, ez, hx + px * wing, hz + pz * wing}, {ex, ez, hx - px * wing, hz - pz * wing}};
+        for (const auto& l : lines) {
+            float x1, y1, x2, y2;
+            if (!projectSegment(cam, l.ax, feet, l.az, l.bx, feet, l.bz, x1, y1, x2, y2)) continue;
+            canvas.line(x1, y1, x2, y2, 8.f * sc, argb(0.16f * pulse, color));
+            canvas.line(x1, y1, x2, y2, 2.6f * sc, argb(0.95f * pulse, color));
+        }
+    }
+
+    void drawMarkers(Canvas& canvas, const Snapshot& s, const Camera& cam, const std::vector<Ranked>& ranked,
+                     const Contact* danger, const pl::modmenu::HudSurfaceSize& surface) const {
+        const float sc = scale;
+        const float W = surface.width, H = surface.height;
+        const float size = 15.f * sc;
+        auto marker = [&](const Contact& c, const std::string& text, std::uint32_t color) {
+            float sx, sy;
+            if (!projectPoint(cam, c.wx, c.wy + c.height + 0.45f, c.wz, sx, sy)) return;
+            if (sx < -50.f || sx > W + 50.f || sy < -50.f || sy > H + 50.f) return;
+            const float w = textWidth(text, size);
+            const float x = std::clamp(sx - w * 0.5f, 4.f, W - w - 4.f);
+            const float y = std::clamp(sy - size * 3.2f, 4.f, H - size * 2.f);
+            canvas.rect(x - 4.f * sc, y - 2.f * sc, w + 8.f * sc, size * 1.3f, argb(0.6f * std::max(opacity, 0.5f), kPanelColor));
+            canvas.line(x - 4.f * sc, y + size * 1.3f - 2.f * sc, x + w + 4.f * sc, y + size * 1.3f - 2.f * sc, 2.f * sc, argb(0.95f, color));
+            canvas.text(x, y, size, argb(1.f, color), text);
+            const float ty = y + size * 1.3f;   // little arrow pointing at the mob
+            canvas.triangle(sx - 6.f * sc, ty, sx + 6.f * sc, ty, sx, ty + 10.f * sc, argb(0.95f, color));
+        };
+
+        std::uintptr_t dangerId = danger ? danger->id : 0;
+        for (std::size_t rank = 0; rank < ranked.size() && rank < 2; ++rank) {
+            const Contact& c = s.contacts[ranked[rank].index];
+            if (c.id == dangerId) continue;   // the danger label below already marks it
+            marker(c, "TARGET " + std::to_string(rank + 1), rank == 0 ? kAmber : kWhite);
+        }
+        if (danger) {
+            float hp = 0.f;
+            std::string text = "DANGEROUS  " + niceName(*danger);
+            for (auto& ch : text) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+            if (!danger->type.empty() && mobMaxHealth(danger->type, hp)) text += formatFloat("  HP %.0f", hp);
+            if (!ranked.empty() && s.contacts[ranked[0].index].id == danger->id) text += "  TARGET 1";
+            marker(*danger, text, kRed);
+        }
+    }
+
+    void drawBanner(Canvas& canvas, float W, float H, double now) {
+        if (now >= bannerUntil || bannerText.empty()) return;
+        const float sc = scale;
+        const float remaining = static_cast<float>(bannerUntil - now);
+        const float alpha = std::min(1.f, remaining / 0.5f);
+        const float size = 19.f * sc;
+        const float w = textWidth(bannerText, size);
+        const float x = std::clamp(W * 0.5f - w * 0.5f, 8.f, std::max(8.f, W - w - 8.f));
+        const float y = H * 0.11f;
+        const float pad = 10.f * sc;
+        canvas.rect(x - pad, y - pad * 0.6f, w + pad * 2.f, size + pad * 1.2f, argb(0.7f * alpha * std::max(opacity, 0.5f), kPanelColor));
+        canvas.brackets(x - pad, y - pad * 0.6f, w + pad * 2.f, size + pad * 1.2f, 9.f * sc, 2.f * sc, argb(alpha, bannerColor));
+        canvas.text(x, y, size, argb(alpha, bannerColor), bannerText);
+    }
+};
+
+// ===========================================================================
 // Config file + Mod Menu registration
 // ===========================================================================
 
@@ -3742,6 +4581,7 @@ inline void start(const Id& modId, const Dir& configDir) {
         c.panels.push_back(std::make_shared<detail::RadarPanel>());
         c.panels.push_back(std::make_shared<detail::ScannerPanel>());
         c.panels.push_back(std::make_shared<detail::GlowPanel>());
+        c.panels.push_back(std::make_shared<detail::TacticalPanel>());
         c.panels.push_back(std::make_shared<detail::AiPanel>());
     }
     detail::loadConfig();
@@ -3770,6 +4610,7 @@ inline void stop() {
     detail::core().settings.aiNeeds = false;
     detail::core().settings.chaseRange = 0.f;
     detail::core().settings.needGlow = false;
+    detail::core().settings.needTactics = false;
     for (auto& panel : c.panels) panel->clear();
     detail::saveConfig();
     c.started = false;
