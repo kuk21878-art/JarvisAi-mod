@@ -123,6 +123,7 @@ struct Settings {
     std::atomic<float> glowRange{40.f};
     std::atomic<float> chaseRange{0.f};      // > 0: scan this far for mobs that chase the player
     std::atomic<float> arFov{70.f};          // vertical field of view shared by the AR overlays
+    std::atomic<float> arBack{0.f};          // blocks the AR camera sits behind the eye (third-person back view)
     std::atomic<bool> needTactics{false};    // the Tactics module wants every hostile around + damage tracking
     std::atomic<float> tacticsRange{48.f};
     std::atomic<float> damageSens{1.f};
@@ -286,6 +287,15 @@ inline constexpr MobSize kMobSizes[] = {
     {"cat", 0.6f, 0.7f}, {"rabbit", 0.4f, 0.5f}, {"bat", 0.5f, 0.9f}, {"iron_golem", 1.4f, 2.7f},
     {"blaze", 0.6f, 1.8f}, {"ghast", 4.0f, 4.0f}, {"phantom", 0.9f, 0.5f}, {"squid", 0.8f, 0.8f},
     {"slime", 0.52f, 0.52f}, {"silverfish", 0.4f, 0.3f}, {"fox", 0.6f, 0.7f}, {"player", 0.6f, 1.8f},
+    {"ravager", 1.95f, 2.2f}, {"warden", 0.9f, 2.9f}, {"wither", 0.9f, 3.5f}, {"ender_dragon", 8.0f, 4.0f},
+    {"hoglin", 1.4f, 1.4f}, {"zoglin", 1.4f, 1.4f}, {"piglin", 0.6f, 1.95f}, {"piglin_brute", 0.6f, 1.95f},
+    {"zombified_piglin", 0.6f, 1.95f}, {"zombie_pigman", 0.6f, 1.95f}, {"vindicator", 0.6f, 1.95f},
+    {"pillager", 0.6f, 1.95f}, {"evoker", 0.6f, 1.95f}, {"vex", 0.4f, 0.8f}, {"guardian", 0.85f, 0.85f},
+    {"elder_guardian", 1.99f, 1.99f}, {"shulker", 1.0f, 1.0f}, {"wither_skeleton", 0.7f, 2.4f},
+    {"bogged", 0.6f, 1.99f}, {"zombie_villager", 0.6f, 1.95f}, {"zombie_villager_v2", 0.6f, 1.95f},
+    {"wandering_trader", 0.6f, 1.95f}, {"llama", 0.9f, 1.87f}, {"trader_llama", 0.9f, 1.87f},
+    {"mule", 1.4f, 1.6f}, {"polar_bear", 1.4f, 1.4f}, {"panda", 1.3f, 1.25f}, {"goat", 0.9f, 1.3f},
+    {"ocelot", 0.6f, 0.7f}, {"snow_golem", 0.7f, 1.9f}, {"blaze", 0.6f, 1.8f}, {"magma_cube", 1.04f, 1.04f},
 };
 
 struct MobHealth { std::string_view name; float hp; };
@@ -1718,6 +1728,12 @@ inline Camera makeCamera(const Snapshot& s, float fovDegrees, float width, float
     cam.rightX = -std::cos(yaw);
     cam.rightY = 0.f;
     cam.rightZ = -std::sin(yaw);
+    const float back = std::clamp(core().settings.arBack.load(), 0.f, 12.f);
+    if (back > 0.f) {   // third-person back view: the camera floats behind the player's head
+        cam.x -= cam.fwdX * back;
+        cam.y -= cam.fwdY * back;
+        cam.z -= cam.fwdZ * back;
+    }
     cam.upX = cam.rightY * cam.fwdZ - cam.rightZ * cam.fwdY;
     cam.upY = cam.rightZ * cam.fwdX - cam.rightX * cam.fwdZ;
     cam.upZ = cam.rightX * cam.fwdY - cam.rightY * cam.fwdX;
@@ -1807,10 +1823,14 @@ public:
     bool arOverlay = true;      // box around the target with callouts (world-anchored)
     float fov = 70.f;           // vertical field of view used by the AR projection
     float entityHeight = 1.8f;  // assumed mob height for the AR box
+    bool reticle = true;        // mobs get a round targeting reticle instead of a box
+    float blockDepth = 0.35f;   // 1 = full cube, small = flat slab (less "3D" for blocks)
+    float camBack = 0.f;        // third-person back view: how far behind your head the camera is
 
     void pushSettings() {
         core().settings.entityHeight = entityHeight;
         core().settings.arFov = fov;
+        core().settings.arBack = camBack;
     }
 
     void onEnabledChanged() override {
@@ -1825,6 +1845,9 @@ public:
         list.push_back(toggleEntry("arOverlay", "AR Overlay", arOverlay));
         list.push_back(floatEntry("fov", "AR Field Of View", fov, 30.f, 110.f));
         list.push_back(floatEntry("entityHeight", "AR Mob Height", entityHeight, 0.5f, 4.f));
+        list.push_back(toggleEntry("reticle", "Round Reticle On Mobs", reticle));
+        list.push_back(floatEntry("blockDepth", "Block Box Depth (1 = cube, small = flat)", blockDepth, 0.05f, 1.f));
+        list.push_back(floatEntry("camBack", "Camera Distance Behind You (3rd person)", camBack, 0.f, 10.f));
         return list;
     }
 
@@ -1843,6 +1866,13 @@ public:
             pushSettings();
             return ok;
         }
+        if (key == "reticle") return parseBool(value, reticle);
+        if (key == "blockDepth") return parseFloat(value, blockDepth);
+        if (key == "camBack") {
+            const bool ok = parseFloat(value, camBack);
+            pushSettings();
+            return ok;
+        }
         return false;
     }
 
@@ -1853,6 +1883,9 @@ public:
         j["arOverlay"] = arOverlay;
         j["fov"] = fov;
         j["entityHeight"] = entityHeight;
+        j["reticle"] = reticle;
+        j["blockDepth"] = blockDepth;
+        j["camBack"] = camBack;
     }
 
     void fromJson(const nlohmann::json& j) override {
@@ -1862,6 +1895,9 @@ public:
         if (j.contains("arOverlay")) arOverlay = j["arOverlay"].get<bool>();
         if (j.contains("fov")) fov = j["fov"].get<float>();
         if (j.contains("entityHeight")) entityHeight = j["entityHeight"].get<float>();
+        if (j.contains("reticle")) reticle = j["reticle"].get<bool>();
+        if (j.contains("blockDepth")) blockDepth = j["blockDepth"].get<float>();
+        if (j.contains("camBack")) camBack = j["camBack"].get<float>();
         core().settings.needScanner = enabled;
         pushSettings();
     }
@@ -1949,18 +1985,39 @@ private:
         const Camera cam = makeCamera(s, fov, surface.width, surface.height);
 
         const float sc = scale;
-        const std::uint32_t lineColor = argb(0.95f, t.kind == Target::Kind::Entity && t.hostile ? kRed : kWhite);
+        const bool isEntity = t.kind == Target::Kind::Entity;
+        const bool useReticle = isEntity && reticle;
+        const std::uint32_t accent = isEntity ? (t.hostile ? kRed : (t.player ? kWhite : kCyan)) : kWhite;
+        const std::uint32_t lineColor = argb(0.95f, accent);
 
-        // Wireframe box.
-        const float xs[2] = {t.minX, t.maxX};
-        const float ys[2] = {t.minY, t.maxY};
-        const float zs[2] = {t.minZ, t.maxZ};
+        float xs[2] = {t.minX, t.maxX};
+        float ys[2] = {t.minY, t.maxY};
+        float zs[2] = {t.minZ, t.maxZ};
+
+        // Blocks: squash the box along the direction we are looking through, so it reads as a flat
+        // slab on the nearest face instead of a deep cube (much calmer in third-person views).
+        if (!isEntity) {
+            const float depth = std::clamp(blockDepth, 0.05f, 1.f);
+            float* lo[3] = {&xs[0], &ys[0], &zs[0]};
+            float* hi[3] = {&xs[1], &ys[1], &zs[1]};
+            const float eye[3] = {cam.x, cam.y, cam.z};
+            int axis = 0;
+            float far = -1.f;
+            for (int i = 0; i < 3; ++i) {
+                const float centre = (*lo[i] + *hi[i]) * 0.5f;
+                if (std::fabs(eye[i] - centre) > far) { far = std::fabs(eye[i] - centre); axis = i; }
+            }
+            const float thick = (*hi[axis] - *lo[axis]) * depth;
+            if (eye[axis] < (*lo[axis] + *hi[axis]) * 0.5f) *hi[axis] = *lo[axis] + thick;
+            else *lo[axis] = *hi[axis] - thick;
+        }
+
         float left = 1e9f, right = -1e9f, top = 1e9f, bottom = -1e9f;
         bool visible = false;
         auto edge = [&](int ax, int ay, int az, int bx, int by, int bz) {
             float x1, y1, x2, y2;
             if (!projectSegment(cam, xs[ax], ys[ay], zs[az], xs[bx], ys[by], zs[bz], x1, y1, x2, y2)) return;
-            canvas.line(x1, y1, x2, y2, 1.6f * sc, lineColor);
+            if (!useReticle) canvas.line(x1, y1, x2, y2, 1.6f * sc, lineColor);
             left = std::min({left, x1, x2}); right = std::max({right, x1, x2});
             top = std::min({top, y1, y2}); bottom = std::max({bottom, y1, y2});
             visible = true;
@@ -1973,6 +2030,16 @@ private:
             }
         }
         if (!visible) return;
+
+        // Where the callout lines attach: box corners, or points on the reticle ring.
+        float tlX = left, tlY = top, trX = right, trY = top, brX = right, brY = bottom;
+        if (useReticle) {
+            const float cx = (left + right) * 0.5f, cy = (top + bottom) * 0.5f;
+            const float radius = std::clamp(std::max(right - left, bottom - top) * 0.5f * 1.15f, 28.f * sc, surface.height * 0.33f);
+            drawReticle(canvas, cx, cy, radius, accent, sc);
+            const float d = radius * 0.7071f;
+            tlX = cx - d; tlY = cy - d; trX = cx + d; trY = cy - d; brX = cx + d; brY = cy + d;
+        }
 
         // Callouts: node on the box, a line out, and a small text block.
         const float size = 17.f * sc;
@@ -2033,9 +2100,33 @@ private:
             if (t.hostile) bottomRight.push_back({"THREAT: ENGAGE?", kRed});
         }
 
-        callout(left, top, -70.f * sc, -55.f * sc, -1, topLeft);
-        callout(right, top, 70.f * sc, -55.f * sc, 1, topRight);
-        callout(right, bottom, 55.f * sc, 50.f * sc, 1, bottomRight);
+        callout(tlX, tlY, -70.f * sc, -55.f * sc, -1, topLeft);
+        callout(trX, trY, 70.f * sc, -55.f * sc, 1, topRight);
+        callout(brX, brY, 55.f * sc, 50.f * sc, 1, bottomRight);
+    }
+
+    // Iron-Man style targeting reticle: thin ring, three slowly turning thick arcs, tick marks, centre dot.
+    static void drawReticle(Canvas& canvas, float cx, float cy, float radius, std::uint32_t color, float sc) {
+        constexpr float kDeg = 0.017453292519943295f;
+        const float spin = static_cast<float>(std::fmod(nowSecondsD() * 40.0, 360.0));
+        canvas.circle(cx, cy, radius, argb(0.07f, color));
+        canvas.ring(cx, cy, radius, 1.4f * sc, argb(0.55f, color), 48);
+        for (int arc = 0; arc < 3; ++arc) {
+            const float start = spin + 120.f * static_cast<float>(arc);
+            float px = cx + std::cos(start * kDeg) * radius * 0.9f, py = cy + std::sin(start * kDeg) * radius * 0.9f;
+            for (int i = 1; i <= 7; ++i) {
+                const float a = (start + 10.f * static_cast<float>(i)) * kDeg;
+                const float nx = cx + std::cos(a) * radius * 0.9f, ny = cy + std::sin(a) * radius * 0.9f;
+                canvas.line(px, py, nx, ny, 4.6f * sc, argb(0.95f, color));
+                px = nx; py = ny;
+            }
+        }
+        for (int tick = 0; tick < 12; ++tick) {
+            const float a = (30.f * static_cast<float>(tick) - spin * 0.5f) * kDeg;
+            canvas.line(cx + std::cos(a) * radius * 1.02f, cy + std::sin(a) * radius * 1.02f,
+                        cx + std::cos(a) * radius * 1.10f, cy + std::sin(a) * radius * 1.10f, 1.6f * sc, argb(0.7f, color));
+        }
+        canvas.ring(cx, cy, 3.f * sc, 1.4f * sc, argb(0.95f, color), 12);
     }
 };
 
