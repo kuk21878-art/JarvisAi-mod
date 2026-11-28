@@ -2298,9 +2298,18 @@ struct VoiceService {
     std::thread worker;
     bool stop = false;
     bool hasText = false;
+    bool listRequested = false;
     std::string text;
     std::string language;
     std::string error;   // guarded by mutex
+    // Voice settings (guarded by mutex)
+    std::string voiceName;   // exact or partial Android voice name; empty = automatic
+    bool male = true;        // prefer a male voice (Jarvis style)
+    float pitch = 0.85f;
+    float rate = 0.95f;
+    // Short message about the chosen voice or the voice list (guarded by mutex)
+    std::string info;
+    std::chrono::steady_clock::time_point infoAt{};
 };
 
 inline VoiceService& voiceService() {
@@ -2314,11 +2323,60 @@ inline std::string voiceError() {
     return v.error;
 }
 
+// The latest voice message, only for a short while after it appeared.
+inline std::string voiceInfo() {
+    auto& v = voiceService();
+    std::lock_guard<std::mutex> lock(v.mutex);
+    if (v.info.empty() || std::chrono::steady_clock::now() - v.infoAt > std::chrono::seconds(25)) return {};
+    return v.info;
+}
+
+inline void voiceConfigure(const std::string& name, bool male, float pitch, float rate) {
+    auto& v = voiceService();
+    std::lock_guard<std::mutex> lock(v.mutex);
+    v.voiceName = name;
+    v.male = male;
+    v.pitch = std::clamp(pitch, 0.4f, 2.f);
+    v.rate = std::clamp(rate, 0.4f, 2.f);
+}
+
+namespace voicedetail {
+
+inline std::string lowered(std::string text) {
+    for (auto& ch : text) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    return text;
+}
+
+inline bool contains(const std::string& text, const std::string& part) { return text.find(part) != std::string::npos; }
+
+// Android does not say which voices are male, so well-known Google voice codes are used
+// (en-GB: gbb, gbd, rjs; en-US: iol, iom, tpd ...). The voice list lets the user pick another one.
+inline bool maleCode(const std::string& name) {
+    static const char* codes[] = {"-x-gbb", "-x-gbd", "-x-rjs", "-x-iol", "-x-iom", "-x-tpd", "-x-aud", "-x-idd"};
+    for (const char* code : codes) {
+        if (contains(name, code)) return true;
+    }
+    return false;
+}
+
+struct VoiceInfo {
+    std::string name;   // lower case
+    std::string tag;    // lower case language tag, e.g. en-gb
+    bool network = false;
+};
+
+}  // namespace voicedetail
+
 inline void voiceLoop() {
     auto& v = voiceService();
     auto setError = [&](const std::string& message) {
         std::lock_guard<std::mutex> lock(v.mutex);
         v.error = message;
+    };
+    auto setInfo = [&](const std::string& message) {
+        std::lock_guard<std::mutex> lock(v.mutex);
+        v.info = message;
+        v.infoAt = std::chrono::steady_clock::now();
     };
 
     JavaVM* vm = findJavaVm();
@@ -2336,42 +2394,192 @@ inline void voiceLoop() {
 
     jobject tts = nullptr;                        // global reference
     std::string currentLanguage;
+    std::string appliedVoiceKey;                  // language + settings of the voice already selected
+    bool voiceOverridden = false;                 // setVoice() was used, so the language default must be restored later
     std::chrono::steady_clock::time_point readyAt{};
 
-    auto speakOnce = [&](const std::string& text, const std::string& language) {
-        auto failed = [&](const char* step) {
-            if (!env->ExceptionCheck()) return false;
-            setError(std::string("VOICE ") + step + ": " + takeJavaException(env));
-            return true;
+    auto failed = [&](const char* step) {
+        if (!env->ExceptionCheck()) return false;
+        setError(std::string("VOICE ") + step + ": " + takeJavaException(env));
+        return true;
+    };
+
+    // Creates the engine once; returns false (with an error message) when that is impossible.
+    auto ensureEngine = [&]() -> bool {
+        if (tts) return true;
+        jclass threadClass = env->FindClass("android/app/ActivityThread");
+        if (failed("context") || !threadClass) { setError("VOICE: no Android context"); return false; }
+        jmethodID currentApplication = env->GetStaticMethodID(threadClass, "currentApplication", "()Landroid/app/Application;");
+        if (failed("context") || !currentApplication) { setError("VOICE: no Android context"); return false; }
+        jobject application = env->CallStaticObjectMethod(threadClass, currentApplication);
+        if (failed("context") || !application) { setError("VOICE: no Android context"); return false; }
+        jclass ttsClass = env->FindClass("android/speech/tts/TextToSpeech");
+        if (failed("engine") || !ttsClass) { setError("VOICE: no text-to-speech engine class"); return false; }
+        jmethodID constructor = env->GetMethodID(ttsClass, "<init>",
+                                                 "(Landroid/content/Context;Landroid/speech/tts/TextToSpeech$OnInitListener;)V");
+        if (failed("engine") || !constructor) { setError("VOICE: no text-to-speech engine"); return false; }
+        jobject created = env->NewObject(ttsClass, constructor, application, static_cast<jobject>(nullptr));
+        if (failed("engine") || !created) { setError("VOICE: could not start text-to-speech"); return false; }
+        tts = env->NewGlobalRef(created);
+        readyAt = std::chrono::steady_clock::now() + std::chrono::milliseconds(1500);
+        currentLanguage.clear();
+        appliedVoiceKey.clear();
+        return true;
+    };
+
+    // Reads every installed voice. Returns false when the engine is not ready yet.
+    auto readVoices = [&](std::vector<voicedetail::VoiceInfo>& out, jobjectArray& array) -> bool {
+        jclass ttsClass = env->GetObjectClass(tts);
+        jmethodID getVoices = env->GetMethodID(ttsClass, "getVoices", "()Ljava/util/Set;");
+        if (failed("voices") || !getVoices) return false;
+        jobject set = env->CallObjectMethod(tts, getVoices);
+        if (failed("voices") || !set) return false;
+        jclass setClass = env->GetObjectClass(set);
+        jmethodID toArray = env->GetMethodID(setClass, "toArray", "()[Ljava/lang/Object;");
+        if (failed("voices") || !toArray) return false;
+        array = static_cast<jobjectArray>(env->CallObjectMethod(set, toArray));
+        if (failed("voices") || !array) return false;
+
+        jclass voiceClass = env->FindClass("android/speech/tts/Voice");
+        jclass localeClass = env->FindClass("java/util/Locale");
+        if (failed("voices") || !voiceClass || !localeClass) return false;
+        jmethodID getName = env->GetMethodID(voiceClass, "getName", "()Ljava/lang/String;");
+        jmethodID getLocale = env->GetMethodID(voiceClass, "getLocale", "()Ljava/util/Locale;");
+        jmethodID needsNetwork = env->GetMethodID(voiceClass, "isNetworkConnectionRequired", "()Z");
+        jmethodID toTag = env->GetMethodID(localeClass, "toLanguageTag", "()Ljava/lang/String;");
+        if (failed("voices") || !getName || !getLocale || !toTag) return false;
+
+        auto text = [&](jobject string) {
+            std::string result;
+            if (!string) return result;
+            const char* chars = env->GetStringUTFChars(static_cast<jstring>(string), nullptr);
+            if (chars) { result = chars; env->ReleaseStringUTFChars(static_cast<jstring>(string), chars); }
+            return result;
         };
 
-        if (!tts) {
-            jclass threadClass = env->FindClass("android/app/ActivityThread");
-            if (failed("context") || !threadClass) { setError("VOICE: no Android context"); return; }
-            jmethodID currentApplication = env->GetStaticMethodID(threadClass, "currentApplication", "()Landroid/app/Application;");
-            if (failed("context") || !currentApplication) { setError("VOICE: no Android context"); return; }
-            jobject application = env->CallStaticObjectMethod(threadClass, currentApplication);
-            if (failed("context") || !application) { setError("VOICE: no Android context"); return; }
-            jclass ttsClass = env->FindClass("android/speech/tts/TextToSpeech");
-            if (failed("engine") || !ttsClass) { setError("VOICE: no text-to-speech engine class"); return; }
-            jmethodID constructor = env->GetMethodID(ttsClass, "<init>",
-                                                     "(Landroid/content/Context;Landroid/speech/tts/TextToSpeech$OnInitListener;)V");
-            if (failed("engine") || !constructor) { setError("VOICE: no text-to-speech engine"); return; }
-            jobject created = env->NewObject(ttsClass, constructor, application, static_cast<jobject>(nullptr));
-            if (failed("engine") || !created) { setError("VOICE: could not start text-to-speech"); return; }
-            tts = env->NewGlobalRef(created);
-            readyAt = std::chrono::steady_clock::now() + std::chrono::milliseconds(1500);
-            currentLanguage.clear();
+        const jsize count = env->GetArrayLength(array);
+        for (jsize i = 0; i < count && i < 400; ++i) {
+            jobject voice = env->GetObjectArrayElement(array, i);
+            voicedetail::VoiceInfo info;
+            if (voice) {
+                jobject name = env->CallObjectMethod(voice, getName);
+                jobject locale = env->CallObjectMethod(voice, getLocale);
+                jobject tag = locale ? env->CallObjectMethod(locale, toTag) : nullptr;
+                info.name = voicedetail::lowered(text(name));
+                info.tag = voicedetail::lowered(text(tag));
+                info.network = needsNetwork ? env->CallBooleanMethod(voice, needsNetwork) == JNI_TRUE : false;
+                if (name) env->DeleteLocalRef(name);
+                if (locale) env->DeleteLocalRef(locale);
+                if (tag) env->DeleteLocalRef(tag);
+                env->DeleteLocalRef(voice);
+            }
+            if (env->ExceptionCheck()) env->ExceptionClear();
+            out.push_back(std::move(info));
         }
+        return true;
+    };
+
+    // Shows which voices exist for the language so the user can type one into "Voice Name".
+    auto listVoices = [&](const std::string& language) {
+        if (!ensureEngine()) return;
+        const auto now = std::chrono::steady_clock::now();
+        if (now < readyAt) std::this_thread::sleep_for(readyAt - now);
+        std::vector<voicedetail::VoiceInfo> voices;
+        jobjectArray array = nullptr;
+        if (!readVoices(voices, array)) { setInfo("VOICES: engine not ready yet, try again in a moment"); return; }
+        const std::string prefix = voicedetail::lowered(language.substr(0, language.find('-')));
+        std::string listing;
+        int shown = 0;
+        for (const auto& voice : voices) {
+            if (voice.tag.rfind(prefix, 0) != 0 || voice.name.empty()) continue;
+            if (shown >= 8) { listing += ", ..."; break; }
+            if (shown) listing += ", ";
+            listing += voice.name;
+            ++shown;
+        }
+        setInfo(shown ? "VOICES (" + prefix + "): " + listing : "VOICES: none installed for " + language);
+    };
+
+    // Picks the voice that matches the settings (a named voice, or a male one). Quietly keeps the
+    // default voice when nothing fits.
+    auto selectVoice = [&](const std::string& language, const std::string& wanted, bool male) {
+        const std::string key = language + "|" + wanted + "|" + (male ? "m" : "d");
+        if (key == appliedVoiceKey) return;
+        std::vector<voicedetail::VoiceInfo> voices;
+        jobjectArray array = nullptr;
+        if (!readVoices(voices, array)) return;          // not ready: try again on the next sentence
+        appliedVoiceKey = key;
+
+        const std::string prefix = voicedetail::lowered(language.substr(0, language.find('-')));
+        const std::string wantedLower = voicedetail::lowered(wanted);
+        int pick = -1;
+        auto better = [&](int candidate) { if (pick < 0 || (voices[static_cast<std::size_t>(pick)].network && !voices[static_cast<std::size_t>(candidate)].network)) pick = candidate; };
+        if (!wantedLower.empty()) {
+            for (int i = 0; i < static_cast<int>(voices.size()); ++i) {
+                if (voices[static_cast<std::size_t>(i)].name == wantedLower) { pick = i; break; }
+            }
+            if (pick < 0) {
+                for (int i = 0; i < static_cast<int>(voices.size()); ++i) {
+                    if (voicedetail::contains(voices[static_cast<std::size_t>(i)].name, wantedLower)) better(i);
+                }
+            }
+        } else if (male) {
+            // English: a British voice first (like the movie Jarvis), then the requested region.
+            std::vector<std::string> regions;
+            if (prefix == "en") regions.push_back("en-gb");
+            regions.push_back(prefix);
+            for (const auto& region : regions) {
+                for (int i = 0; i < static_cast<int>(voices.size()); ++i) {
+                    const auto& voice = voices[static_cast<std::size_t>(i)];
+                    const bool regionOk = region.find('-') != std::string::npos ? voice.tag == region
+                                                                                 : voice.tag.rfind(region, 0) == 0;
+                    if (regionOk && voicedetail::maleCode(voice.name)) better(i);
+                }
+                if (pick >= 0) break;
+            }
+        }
+        if (pick < 0) {
+            if (voiceOverridden) { currentLanguage.clear(); voiceOverridden = false; }   // back to the default voice
+            setInfo(wantedLower.empty() ? "VOICE: no male voice found, using the default voice (try Voice Name)"
+                                        : "VOICE: voice '" + wanted + "' not found");
+            return;
+        }
+        jclass ttsClass = env->GetObjectClass(tts);
+        jmethodID setVoice = env->GetMethodID(ttsClass, "setVoice", "(Landroid/speech/tts/Voice;)I");
+        if (failed("voice") || !setVoice) return;
+        jobject voice = env->GetObjectArrayElement(array, pick);
+        const jint result = voice ? env->CallIntMethod(tts, setVoice, voice) : -1;
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        if (result == 0) voiceOverridden = true;
+        setInfo(result == 0 ? "VOICE: using " + voices[static_cast<std::size_t>(pick)].name
+                            : "VOICE: could not use " + voices[static_cast<std::size_t>(pick)].name);
+    };
+
+    auto speakOnce = [&](const std::string& text, const std::string& language) {
+        if (!ensureEngine()) return;
 
         const auto now = std::chrono::steady_clock::now();
         if (now < readyAt) std::this_thread::sleep_for(readyAt - now);
+
+        std::string wanted;
+        bool male = true;
+        float pitch = 1.f, rate = 1.f;
+        {
+            std::lock_guard<std::mutex> lock(v.mutex);
+            wanted = v.voiceName;
+            male = v.male;
+            pitch = v.pitch;
+            rate = v.rate;
+        }
 
         jclass ttsClass = env->GetObjectClass(tts);
         jclass localeClass = env->FindClass("java/util/Locale");
         jmethodID forTag = localeClass ? env->GetStaticMethodID(localeClass, "forLanguageTag", "(Ljava/lang/String;)Ljava/util/Locale;") : nullptr;
         jmethodID setLanguage = env->GetMethodID(ttsClass, "setLanguage", "(Ljava/util/Locale;)I");
         jmethodID speak = env->GetMethodID(ttsClass, "speak", "(Ljava/lang/CharSequence;ILandroid/os/Bundle;Ljava/lang/String;)I");
+        jmethodID setPitch = env->GetMethodID(ttsClass, "setPitch", "(F)I");
+        jmethodID setRate = env->GetMethodID(ttsClass, "setSpeechRate", "(F)I");
+        if (env->ExceptionCheck()) env->ExceptionClear();   // pitch and rate are optional
         if (failed("methods") || !forTag || !setLanguage || !speak) { setError("VOICE: text-to-speech API missing"); return; }
 
         jint languageResult = 0;
@@ -2381,9 +2589,14 @@ inline void voiceLoop() {
                 if (failed("language")) return;
                 languageResult = env->CallIntMethod(tts, setLanguage, locale);
                 if (failed("language")) return;
-                if (languageResult >= 0) currentLanguage = language;
+                if (languageResult >= 0) { currentLanguage = language; appliedVoiceKey.clear(); }
             }
             if (currentLanguage == language) {
+                selectVoice(language, wanted, male);
+                if (currentLanguage != language) continue;   // the default voice is restored by setting the language again
+                if (setPitch) env->CallIntMethod(tts, setPitch, pitch);
+                if (setRate) env->CallIntMethod(tts, setRate, rate);
+                if (env->ExceptionCheck()) env->ExceptionClear();
                 const jint result = env->CallIntMethod(tts, speak, env->NewStringUTF(text.c_str()), 0,
                                                        static_cast<jobject>(nullptr), env->NewStringUTF("jarvis"));
                 if (failed("speak")) return;
@@ -2400,16 +2613,20 @@ inline void voiceLoop() {
 
     for (;;) {
         std::string text, language;
+        bool listing = false;
         {
             std::unique_lock<std::mutex> lock(v.mutex);
-            v.wake.wait(lock, [&] { return v.stop || v.hasText; });
+            v.wake.wait(lock, [&] { return v.stop || v.hasText || v.listRequested; });
             if (v.stop) break;
             text = std::move(v.text);
-            language = std::move(v.language);
+            language = v.language;
+            listing = v.listRequested;
             v.hasText = false;
+            v.listRequested = false;
         }
-        env->PushLocalFrame(32);
-        speakOnce(text, language);
+        env->PushLocalFrame(64);
+        if (listing) listVoices(language.empty() ? std::string("en-US") : language);
+        if (!text.empty()) speakOnce(text, language);
         env->PopLocalFrame(nullptr);
     }
 
@@ -2431,6 +2648,19 @@ inline void voiceSpeak(const std::string& text, const std::string& language) {
         v.text = text;
         v.language = language.empty() ? std::string("en-US") : language;
         v.hasText = true;
+        v.stop = false;
+        if (!v.worker.joinable()) v.worker = std::thread(voiceLoop);
+    }
+    v.wake.notify_one();
+}
+
+// Lists the installed voices for a language (the result appears for a few seconds in the AI panel).
+inline void voiceRequestList(const std::string& language) {
+    auto& v = voiceService();
+    {
+        std::lock_guard<std::mutex> lock(v.mutex);
+        v.language = language.empty() ? std::string("en-US") : language;
+        v.listRequested = true;
         v.stop = false;
         if (!v.worker.joinable()) v.worker = std::thread(voiceLoop);
     }
@@ -2725,6 +2955,12 @@ public:
     bool autoReport = true;          // announce the mob under the crosshair and new hostiles nearby
     bool voice = true;               // read reports and AI answers aloud
     std::string voiceLang = "en-US"; // BCP-47 tag: en-US, id-ID ...
+    bool maleVoice = true;           // prefer a deep male voice (British English when available)
+    std::string voiceName;           // optional: an exact voice from "Show Voices"
+    float voicePitch = 0.85f;        // lower = deeper
+    float voiceRate = 0.95f;         // speaking speed
+
+    void pushVoice() { voiceConfigure(voiceName, maleVoice, voicePitch, voiceRate); }
     float warnRadius = 24.f;         // hostiles inside this distance trigger a warning
     bool autoInsight = true;         // Jarvis asks the AI by itself when something important happens
     float insightCooldown = 30.f;    // minimum seconds between automatic AI insights
@@ -2757,6 +2993,11 @@ public:
         list.push_back(floatEntry("chaseRadius", "Chase Warning Range (blocks)", chaseRadius, 15.f, 80.f));
         list.push_back(toggleEntry("voice", "Voice (speak aloud)", voice));
         list.push_back({"voiceLang", "Voice Language (en-US / id-ID)", pl::modmenu::ConfigType::Text, voiceLang, "", ""});
+        list.push_back(toggleEntry("maleVoice", "Male Voice (Jarvis style)", maleVoice));
+        list.push_back(floatEntry("voicePitch", "Voice Pitch (lower = deeper)", voicePitch, 0.5f, 1.5f));
+        list.push_back(floatEntry("voiceRate", "Voice Speed", voiceRate, 0.6f, 1.4f));
+        list.push_back({"voiceName", "Voice Name (optional)", pl::modmenu::ConfigType::Text, voiceName, "", ""});
+        list.push_back({"voiceList", "Show Installed Voices", pl::modmenu::ConfigType::Button, "false", "", ""});
         list.push_back(floatEntry("warnRadius", "Warning Radius", warnRadius, 8.f, 80.f));
         list.push_back(floatEntry("showSeconds", "Show Answer (seconds)", showSeconds, 5.f, 300.f));
         list.push_back(floatEntry("panelWidth", "Panel Width", panelWidth, 200.f, 700.f));
@@ -2799,6 +3040,18 @@ public:
         }
         if (key == "voice") return parseBool(value, voice);
         if (key == "voiceLang") { voiceLang = trimCopy(value); if (voiceLang.empty()) voiceLang = "en-US"; return true; }
+        if (key == "maleVoice") { const bool ok = parseBool(value, maleVoice); pushVoice(); return ok; }
+        if (key == "voicePitch") { const bool ok = parseFloat(value, voicePitch); pushVoice(); return ok; }
+        if (key == "voiceRate") { const bool ok = parseFloat(value, voiceRate); pushVoice(); return ok; }
+        if (key == "voiceName") { voiceName = trimCopy(value); pushVoice(); return true; }
+        if (key == "voiceList") {
+            // Ignore the callbacks the menu may fire while it registers the control.
+            if (std::chrono::steady_clock::now() - createdAt > std::chrono::seconds(4)) {
+                pushVoice();
+                voiceRequestList(voiceLang);
+            }
+            return false;
+        }
         if (key == "warnRadius") return parseFloat(value, warnRadius);
         if (key == "question") {
             pending = trimCopy(value);
@@ -2824,6 +3077,10 @@ public:
         j["autoReport"] = autoReport;
         j["voice"] = voice;
         j["voiceLang"] = voiceLang;
+        j["maleVoice"] = maleVoice;
+        j["voiceName"] = voiceName;
+        j["voicePitch"] = voicePitch;
+        j["voiceRate"] = voiceRate;
         j["warnRadius"] = warnRadius;
         j["autoInsight"] = autoInsight;
         j["insightCooldown"] = insightCooldown;
@@ -2843,6 +3100,11 @@ public:
         if (j.contains("autoReport")) autoReport = j["autoReport"].get<bool>();
         if (j.contains("voice")) voice = j["voice"].get<bool>();
         if (j.contains("voiceLang") && j["voiceLang"].is_string()) voiceLang = j["voiceLang"].get<std::string>();
+        if (j.contains("maleVoice")) maleVoice = j["maleVoice"].get<bool>();
+        if (j.contains("voiceName") && j["voiceName"].is_string()) voiceName = j["voiceName"].get<std::string>();
+        if (j.contains("voicePitch")) voicePitch = j["voicePitch"].get<float>();
+        if (j.contains("voiceRate")) voiceRate = j["voiceRate"].get<float>();
+        pushVoice();
         if (j.contains("warnRadius")) warnRadius = j["warnRadius"].get<float>();
         if (j.contains("autoInsight")) autoInsight = j["autoInsight"].get<bool>();
         if (j.contains("insightCooldown")) insightCooldown = j["insightCooldown"].get<float>();
@@ -2939,7 +3201,12 @@ public:
         }
 
         const std::string voiceProblem = voice ? voiceError() : std::string();
-        const std::size_t problemLines = voiceProblem.empty() ? 0 : 1;
+        std::vector<std::string> infoLines;
+        if (voice) {
+            const std::string info = voiceInfo();
+            if (!info.empty()) infoLines = wrapText(info, size * 0.85f, width - pad * 2.f, 4);
+        }
+        const std::size_t problemLines = (voiceProblem.empty() ? 0 : 1) + infoLines.size();
         const float height = pad * 2.f + row * (static_cast<float>(lines.size() + problemLines) + 1.f);
         Canvas canvas;
         canvas.panel(hudX, hudY, width, height, sc, opacity);
@@ -2952,6 +3219,11 @@ public:
         }
         if (!voiceProblem.empty()) {
             canvas.text(hudX + pad, y, size * 0.85f, argb(1.f, kAmber), wrapText(voiceProblem, size * 0.85f, width - pad * 2.f, 1).front());
+            y += row;
+        }
+        for (const auto& line : infoLines) {
+            canvas.text(hudX + pad, y, size * 0.85f, argb(1.f, kGreen), line);
+            y += row;
         }
         canvas.submit(id);
     }
